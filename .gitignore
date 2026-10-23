@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+pptxenv/
+
+# --- Node ---
+node_modules/
+
+# --- Caches: downloaded models, datasets, HF cache, embeddings ---
+.cache/
+**/.cache/
+*.faiss
+*.index
+
+# --- Test / coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Streamlit ---
+.streamlit/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+
+# --- Large generated artifacts (regenerable from /common scripts + configs) ---
+# Small results (CSVs, PNGs, JSON metrics) used for the phase comparisons ARE
+# committed on purpose -- see phase1_baseline/results and
+# phase2_proposed/results. Only bulky regenerable intermediates are ignored.
+*.npy
+*.npz
+!phase1_baseline/results/**/*.npy
+!phase2_proposed/results/**/*.npy

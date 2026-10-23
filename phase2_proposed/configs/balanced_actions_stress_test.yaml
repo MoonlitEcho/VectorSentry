@@ -1,0 +1,79 @@
+# Supplementary stress-test config -- NOT the primary Phase 2 result.
+#
+# Same corpus/seed/ratios/budgets as configs/default.yaml. Only
+# scheduler.recovery_patch differs.
+#
+# Why this exists: under the primary config's empirically-measured
+# recovery_patch=0.064 (from Phase 1's real 1D measurements), patch's cost
+# efficiency (0.064/0.1=0.64) is uniformly WORSE than full re-embed's
+# (1.0/1.0=1.0) for every document -- because Benefit(i,action) =
+# severity(i) * traffic(i) * recovery_factor(action), severity/traffic
+# always cancel out of a same-document cross-action efficiency comparison,
+# so ONE action always uniformly dominates the other under this formula.
+# That makes the primary result's optimality gap trivially ~0% (greedy-by-
+# ratio IS exactly optimal for uniform-cost 0/1 knapsack) and means patch
+# is almost never chosen -- a real, honest finding (see DEVLOG.md's
+# sub-phase 2A entry), but not a demonstration of the scheduler making a
+# genuinely hard three-way tradeoff.
+#
+# Here recovery_patch=0.12 gives patch efficiency (0.12/0.1=1.2) only
+# SLIGHTLY better than full re-embed's (1.0) -- close to parity rather than
+# uniform domination. With efficiency this close, which action a greedy
+# ratio-sort picks per document becomes sensitive to budget lumpiness
+# (spending early on many cheap patches can leave insufficient leftover
+# budget for a later, more valuable full re-embed), which is exactly the
+# kind of mismatch the exact solver is meant to catch and the greedy
+# heuristic is meant to approximate -- producing a genuinely non-trivial,
+# measurable optimality gap.
+#
+# Run with:
+#   python phase2_proposed/scripts/run_scheduler.py --config phase2_proposed/configs/balanced_actions_stress_test.yaml
+
+seed: 42
+
+corpus:
+  name: scifact
+  max_docs: 5000
+
+embedding_models:
+  generation_a: sentence-transformers/all-MiniLM-L6-v2
+  generation_b: sentence-transformers/all-MiniLM-L12-v2
+
+contamination:
+  ratios: [0.05, 0.10, 0.20, 0.35, 0.50]
+
+traffic:
+  distribution: zipf
+  zipf_s: 1.2
+
+index:
+  backend: faiss
+  metric: cosine
+
+budget:
+  levels: [0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+
+detection:
+  knn_k: 10
+  lof_k: 20
+
+remediation:
+  cost_full_reembed: 1.0
+  cost_patch: 0.1
+  calibration_sample_size: 300
+  detector: knn_ood
+
+scheduler:
+  recovery_full_reembed: 1.0
+  recovery_patch: 0.12 # deliberately near cost-efficiency parity with full re-embed -- see header comment
+  recovery_defer: 0.0
+  severity_detector: knn_ood
+  exact_solver_sample_size: 300
+
+migration:
+  golden_query_count: 20
+  regression_tolerance: 0.0
+
+paths:
+  results_dir: phase2_proposed/results/balanced_actions_stress_test
+  cache_dir: .cache

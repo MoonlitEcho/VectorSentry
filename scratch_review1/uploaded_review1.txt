@@ -1,0 +1,470 @@
+<!-- Slide number: 1 -->
+
+KUMARAGURU COLLEGE OF TECHNOLOGY  •  KSI
+VectorSentry
+Budget-Aware Prioritization for Mixed-Generation Embedding
+Contamination in Production Vector Databases
+
+Team Member(s): [Full Name — Register No. — Department]  (add one line per member)
+Guide: [Guide Name, Designation]
+Review Date: [Confirm exact review date]   |   UG Capstone Projects (2026-27) — Phase I, Review I
+Fields in brackets must be completed before presenting — see final checklist.
+
+### Notes:
+Good [morning/afternoon]. I'm presenting VectorSentry — a proposed system to detect and safely fix a silent failure mode in production vector databases: mixed-generation embedding contamination. This is Review I — our first pitch of the idea. VectorSentry is scoped as a full-year capstone: today I'll walk you through the problem, the literature grounding it, our proposed design, and our year-long execution plan — not finished results.
+
+<!-- Slide number: 2 -->
+PROBLEM IDENTIFICATION
+Problem Statement
+Production vector databases silently degrade in retrieval quality when a subset of documents is re-embedded by a different generation of the embedding model than the rest of the corpus — after a provider update, a model migration, or an incomplete backfill.
+
+HOW WE WILL VALIDATE THIS
+Proposed evaluation approach for Phase II — not yet executed:
+1
+Build a controlled benchmark
+
+Real documents, two real open embedding-model generations, contamination introduced at known, controlled ratios.
+Root cause
+Cosine similarity is not comparable across embedding-model generations — each model's outputs occupy a different geometry.
+2
+Measure retrieval quality
+Track nDCG@10 / Recall@10 as the contamination ratio rises from clean to heavily mixed.
+
+Why it's silent
+3
+Test the core hypothesis
+No exception is thrown. The index still returns k results; only relevance quietly worsens.
+Quality is expected to degrade progressively and silently — no exception thrown at any ratio — confirming the risk this project addresses.
+
+Documented in industry
+
+A genuine engineering problem, grounded in mechanism and documented industry evidence — the benchmark above is proposed Phase II work, not a result we already have.
+OpenAI updated text-embedding-ada-002 multiple times through 2023; Cohere's embed-v3 differs internally from embed-v2 — teams re-embed piecemeal, creating exactly this mix.
+VectorSentry  |  Review I
+2
+
+### Notes:
+The core problem: a vector database can end up with documents embedded by two different generations of a model — say, half by an old provider version, half by a new one — after an update. Cosine similarity across those two generations is meaningless, but nothing errors out. It just quietly retrieves worse results. This is Review I, so we haven't run the full benchmark yet — that's planned Phase II work. What we're presenting today is the mechanism, the industry evidence it really happens, and exactly how we intend to quantify it: a controlled benchmark mixing two real open embedding models over a real IR corpus, measuring nDCG@10 as contamination rises. And this happens in the real world — OpenAI and Cohere have both shipped embedding updates that silently changed their models' internal geometry. Likely follow-up: 'why haven't you run this yet?' — answer: this review is a one-year project's starting pitch; the benchmark, detector, and scheduler are all Phase II build-and-evaluate work, scoped deliberately so it's achievable well within the year.
+
+<!-- Slide number: 3 -->
+OBJECTIVES
+Objectives & Scope
+
+Detect reliably
+Target / success criterion
+
+1
+Target: F1 ? 0.50, with no ground-truth labels used
+Flag mixed-generation contamination with an unsupervised, oracle-free detector.
+
+Prioritize optimally
+Target / success criterion
+
+2
+Target: optimality gap ? 5% vs. the exact solver
+Formulate remediation as a budget-constrained optimization, not a uniform sweep.
+
+Recover efficiently
+Target / success criterion
+
+3
+Target: ? 40% quality headroom recovered at ?30% budget
+Recover more retrieval quality per unit budget than current (FIFO) practice.
+
+Deploy safely
+Target / success criterion
+
+4
+Target: zero silent regressions ever ship to the live index
+Guarantee no remediation ships if it would regress a protected query set.
+Scope: BEIR SciFact corpus (5,000 docs), open sentence-transformer models, laptop-scale reproducible benchmark.   Out of scope (this phase): live production traffic replay; multi-corpus generalization — see Future Work.
+VectorSentry  |  Review I
+3
+
+### Notes:
+Four objectives, each paired with a measurable target we've set for ourselves before writing any code — these are success criteria for Phase II, not results we already have. Detect: we're targeting F1 of at least 0.5 for an unsupervised detector with no ground-truth labels. Prioritize: we want our fast greedy heuristic within 5% of the true mathematical optimum from the exact solver. Recover: we want to beat current practice — full re-embed everything, FIFO order — meaningfully under a tight budget. Deploy safely: this is the one objective most people don't think to set — we want a guarantee, not a hope, that we never silently ship a worse index; that's why a safety gate is a first-class objective, not an afterthought. Scope is bounded deliberately — a laptop-reproducible benchmark, not a live production deployment, which keeps the whole project achievable within the year.
+
+<!-- Slide number: 4 -->
+DOMAIN / COHORT KNOWLEDGE
+Domain & Cohort Knowledge
+
+Current Trends & Technologies
+DOMAIN
+Retrieval-Augmented Generation (RAG) has made vector search a core production dependency; providers now ship frequent embedding-model updates (OpenAI, Cohere, open sentence-transformers). Over 20 commercial vector-database systems have launched in the past five years (Pan et al., 2024, VLDB Journal).
+Artificial Intelligence & Machine Learning
+Sub-domain: Information Retrieval & MLOps Systems Engineering
+[Confirm exact enrolled cohort/track name with coordinator]
+
+Real-World Applications
+Pinecone, Weaviate, Milvus, and FAISS/HNSW-based search stacks power semantic search and RAG assistants at companies ranging from startups to major AI labs — every one of them is exposed to this exact silent-drift failure mode.
+
+KEY TERMS
+• Embedding — a dense numeric vector encoding meaning
+• Cosine similarity — angle-based closeness between vectors
+• ANN index (e.g. HNSW/FAISS) — fast approximate vector search
+• Embedding drift — silent semantic shift across model versions
+
+Relevance to This Project
+VectorSentry sits precisely at the intersection of information-retrieval evaluation, anomaly detection, and MLOps deployment safety — three established sub-fields this project deliberately combines rather than treats in isolation.
+VectorSentry  |  Review I
+4
+
+### Notes:
+Our domain is AI/ML applied to information retrieval and MLOps — specifically, the operational side of running vector search systems in production, not just training embedding models. The field is moving fast: RAG has made vector databases a default dependency, and there are now over twenty commercial vector-database products, per a 2024 VLDB Journal survey we cite. Every one of these systems — Pinecone, Weaviate, Milvus — is exposed to the exact contamination problem we're solving, because they all face the same embedding-model-update reality.
+
+<!-- Slide number: 5 -->
+LITERATURE SURVEY — 1 OF 2
+Literature Survey — Landscape
+15 peer-reviewed sources across three clusters
+
+Cluster A — Detecting Contamination
+Cluster B — Cheaply Realigning Embeddings
+Cluster C — Foundations We Build On
+
+3 papers
+8 papers
+Sun et al. (2022) — KNN-OOD, ICML
+Lu et al. (2024) — OOD survey, ACM CSUR
+Liu et al. (2008) — Isolation Forest, IEEE ICDM
+Breunig et al. (2000) — LOF, ACM SIGMOD
+Vejendla (2025) — Drift-Adapter, EMNLP
+Hu et al. (2022) — Backward-Compatible Embeddings, ACM KDD
+Lample et al. (2018) — Procrustes alignment (MUSE), ICLR
+Malkov & Yashunin (2020) — HNSW, IEEE TPAMI
+Pan et al. (2024) — Vector DB survey, Springer VLDBJ
+Muennighoff et al. (2023) — MTEB, ACL
+Wu et al. (2024) — RAG survey, arXiv
+Fuster Baggetto & Fresno (2022) — Anisotropy, ACL
+Sinha & Zoltners (1979) — Knapsack, Op. Research
+Breslau et al. (1999) — Zipf traffic, IEEE INFOCOM
+Karval & Singh (2023) — Silent ML failures, IEEE
+
+Mature, well-validated anomaly-detection theory — but none targets embedding-generation mismatch specifically, and none says what to do once you've detected it.
+Show HOW to patch embeddings cheaply (95–99% recall recovery at ~1% the cost) — but every one applies ONE fix uniformly to the whole corpus. None decides WHICH documents to fix first under a budget.
+Vector-search infrastructure, embedding-model benchmarking, and — critically — the Operations-Research and systems theory (knapsack optimization, skewed traffic) our own methodology is built on.
+VectorSentry  |  Review I
+5
+
+### Notes:
+We reviewed fifteen sources organized into three clusters. Cluster A covers detection theory — KNN-OOD, Isolation Forest, LOF, and a 2024/2025 ACM Computing Surveys review of the whole OOD-detection field. Cluster B is the most directly relevant to our contribution: Drift-Adapter, published at EMNLP just this year, and Meta/Stanford's Backward-Compatible-Embeddings paper from KDD 2022, both show you can cheaply realign an embedding space instead of paying for a full re-embed. But — and this is the crux of our research gap — every one of them applies that fix as ONE uniform action to the whole corpus. Neither asks 'which documents matter enough to fix first, and which merely need a cheap patch, under a budget I can't exceed.' Cluster C is our foundation layer — vector-database systems literature, embedding benchmarking, and, importantly, the 1979 Operations Research paper whose knapsack formulation our scheduler design is grounded in, plus the 1999 paper establishing that real query traffic follows a Zipf distribution, which is exactly the traffic model our planned benchmark will use.
+
+<!-- Slide number: 6 -->
+LITERATURE SURVEY — 2 OF 2
+Literature Survey — Comparison Table
+9 of 15 reviewed works shown (most directly load-bearing for our design); complete 15-row table in the supporting document.
+| Author(s), Year | Method | Key Finding | Gap Identified |
+| --- | --- | --- | --- |
+| Vejendla, 2025 | Learned adapter (Procrustes/MLP) | Recovers 95–99% recall at ~1% the cost of full re-embed | Applies one uniform fix to the whole corpus — no per-document decision |
+| Sun et al., 2022 | KNN distance in embedding space | Non-parametric OOD detection, no distributional assumptions | Detects anomalies; doesn't touch what to do about them |
+| Lu et al., 2024 | Task-oriented OOD survey | Maps the whole OOD-detection field by deployment scenario | No embedding-generation-drift-specific treatment |
+| Hu et al., 2022 | Backward-compatible training | New model deployable without any backfill | Same uniform-fix limitation as Drift-Adapter |
+| Malkov & Yashunin, 2020 | HNSW graph index | Logarithmic-time approximate search at scale | Assumes a geometrically consistent index — silently violated by contamination |
+| Pan et al., 2024 | Systems survey, 20+ VDBMSs | Maps vector-DB architecture space comprehensively | No treatment of post-deployment embedding integrity |
+| Sinha & Zoltners, 1979 | Multiple-Choice Knapsack (ILP) | Exact branch-and-bound formulation for one-per-group choice under budget | Generic OR theory — never applied to embedding remediation |
+| Liu et al., 2008 | Isolation Forest | Linear-time, distance-free anomaly isolation | General-purpose; not evaluated on embedding-space anisotropy |
+| Breunig et al., 2000 | Local Outlier Factor (LOF) | Local density ratio catches density-varying anomalies | Same generality gap as Isolation Forest |
+VectorSentry  |  Review I
+6
+
+### Notes:
+This is the required comparison table — author, year, method, key finding, and the gap each paper leaves open. Reading down the 'gap identified' column, a pattern jumps out: every single one of these works stops at either detecting the problem or fixing it uniformly. None of them decides WHICH documents get which treatment under a real budget — that column is where our own contribution lives, and it's the throughline into the research-gap slide next.
+
+<!-- Slide number: 7 -->
+LITERATURE ? RESEARCH GAP
+From Literature to Research Gap
+
+Two mature, separate bodies of work: OOD/anomaly detection (Cluster A) and cheap embedding realignment (Cluster B).
+Existing research
+
+1
+
+?
+
+Detect anomalous vectors ? apply ONE fix (full re-embed or one uniform patch transform) to everyone flagged.
+Common approach
+
+2
+?
+
+Detection is well-validated (KNN-OOD F1 competitive); Drift-Adapter-style patching recovers 95–99% recall at ~1% the compute cost.
+Strengths
+
+3
+?
+
+Every reviewed fix mechanism is corpus-wide and uniform — none reasons about WHICH document to fix first when the budget can't cover everyone.
+Limitations
+
+4
+
+?
+
+Given N contaminated documents with different severity AND different real query traffic, and 3 possible actions of different cost/quality, how should ONE bounded budget be allocated system-wide?
+Unresolved problem
+
+5
+?
+
+No budget-aware, traffic-informed, per-document PRIORITIZATION layer exists between 'detect' and 'fix' — and no safety gate ensures a chosen plan doesn't regress production quality before it ships.
+Research gap
+
+6
+VectorSentry  |  Review I
+7
+
+### Notes:
+This slide is the logical spine of the whole project. Starting from what's already known — mature detection theory and mature-but-uniform repair mechanisms — I walk down to exactly where the literature stops: nobody decides WHICH document to fix first under a real budget. That's not a vague gap — I can point to it in the comparison table on the previous slide, in the 'gap identified' column, for every single Cluster A and B paper. Our contribution isn't invented from nothing either — the optimization core is a 1979 Operations Research formulation, and the patch mechanism itself is grounded directly in this year's Drift-Adapter paper. What's new is combining them into one budget-aware decision layer with a safety gate.
+
+<!-- Slide number: 8 -->
+
+PROPOSED CONCEPT
+Proposed Concept — VectorSentry
+
+Prioritize contamination remediation the way an incident-response team would — not by fixing everything, and not by fixing arbitrarily, but by ranking WHAT to fix first under a real budget, using real traffic and real severity signals, verified safe before every change goes live.
+For every flagged document, the scheduler chooses exactly one of three actions:
+
+Full Re-embed
+Patch
+Defer
+High cost   •   Full quality recovery
+Low cost   •   Partial recovery
+Zero cost   •   Zero recovery
+Re-run the document through the current embedding model — the ground-truth fix.
+A lightweight learned Procrustes/linear transform (Drift-Adapter-style) realigns the old embedding — cheap, imperfect.
+Leave it contaminated for now — the mathematically correct choice when severity × traffic is low relative to cost.
+VectorSentry  |  Review I
+8
+
+### Notes:
+The concept, in one sentence: treat contamination remediation as an incident-response prioritization problem, not a batch job. Concretely, for every document our detector flags, VectorSentry's scheduler picks exactly one of three actions — full re-embed for the documents that matter most, a cheap patch for the ones where partial recovery is good enough, or defer for the ones not worth spending budget on at all. That third option, Defer, is deliberately part of the formal action set, not an afterthought — sometimes the mathematically correct answer really is 'not yet,' and pretending otherwise is how uniform strategies waste budget.
+
+<!-- Slide number: 9 -->
+ENGINEERING APPLICATIONS
+System Architecture
+pass
+
+Live Vector
+Database
+?
+
+Detect
+?
+
+Prioritize
+?
+
+Migrate
+?
+
+Verify
+
+Cutover
+(live)
+
+Rollback
+(unchanged)
+fail — retried
+or deferred
+
+Detect:  KNN-OOD score vs. a stable-baseline-calibrated threshold — no oracle labels used.
+planned continuous autonomous monitoring — "Live Sentry" module (proposed 2-5s poll loop)
+
+Prioritize:  MCKP scheduler: severity × traffic × recovery, one shared budget, exact ILP + fast greedy.
+
+Migrate:  Shadow-build the proposed fix — the live index is never mutated in place.
+
+Verify:  Golden-query canary check: does the shadow regress a curated high-value query set?
+VectorSentry  |  Review I
+9
+
+### Notes:
+This is the proposed architecture — the pipeline we plan to build. A live vector database feeds into Detect, which will score documents against a threshold calibrated from a known-clean baseline — not an oracle, exactly what a real operator would have. Prioritize is our scheduler design — the knapsack solver deciding full re-embed, patch, or defer for every flagged document. Migrate builds the proposed fix as a shadow copy — the live index is never touched directly, matching real zero-downtime deployment practice. Verify is the safety gate: it will check the shadow against a curated set of high-value 'golden queries' and only allow cutover if nothing regresses; on failure, it rolls back automatically and either retries with more budget or defers, so production is never silently degraded. The whole loop is designed to run autonomously and continuously — 'Live Sentry' is the proof-of-concept module we plan to build to demonstrate that, polling every two to five seconds with zero manual intervention beyond the initial trigger.
+
+<!-- Slide number: 10 -->
+ENGINEERING METHODOLOGY
+Engineering Methodology & Modules
+Four independently testable modules — each with a defined input/output contract, so any one can be swapped or re-validated in isolation.
+
+M1
+
+M2
+
+M3
+
+M4
+Detection
+Prioritization
+Migration
+Verification & Cutover
+KNN-OOD scoring, calibrated against a stable-baseline percentile threshold (no oracle contamination labels used).
+MCKP formulation — 3 actions x N documents, 1 shared budget; solved exactly via ILP (small scale) and via a frontier-greedy approximation (production scale).
+Shadow-build the planned fixes as a separate copy; the live index is never mutated in place, matching real zero-downtime deployment practice.
+Golden-query canary evaluation against the shadow; atomic cutover on pass, automatic rollback + retry/defer on fail.
+
+In: Gen-A/Gen-B embeddings  ?  Out: per-doc anomaly score + flag
+In: flagged docs + severity + traffic  ?  Out: per-doc action plan
+In: action plan  ?  Out: shadow embedding set
+In: shadow set  ?  Out: live index update, or abort + reason
+VectorSentry  |  Review I
+10
+
+### Notes:
+Our methodology follows standard software-engineering modular decomposition — four modules, each with a strict input/output contract, so each can be unit-tested and even swapped independently. Detection and Migration/Verification are adapted from established practice — KNN-OOD from Sun et al. 2022, shadow-build-and-cutover from real zero-downtime deployment patterns. Prioritization, Module 2, is our own contribution — the knapsack formulation grounded in Sinha and Zoltners' 1979 Operations Research paper, applied here for the first time to embedding remediation. We deliberately chose this framework — a well-understood exact optimization technique — over something like reinforcement learning, because it's provably optimal at small scale, has a fast well-understood approximation for production scale, and every decision it makes is explainable, which matters a great deal for a system that's allowed to modify a production database.
+
+<!-- Slide number: 11 -->
+NOVELTY & CREATIVITY
+What's Genuinely New Here
+
+First application (to our literature) of a Multiple-Choice Knapsack formulation to embedding-contamination remediation — prior OR knapsack work targets resource allocation, not vector-DB integrity.
+A formal 3-way action space {Full Re-embed, Patch, Defer} where every reviewed prior work offers only a binary or single-fix choice.
+A closed detect ? prioritize ? migrate ? verify loop with an automated safety gate — prior work stops at detection or at a one-shot patch, with no verified-safe deployment step.
+
+Novelty
+
+Reframing 'which documents to fix' as a classic combinatorial-optimization problem (knapsack) rather than a heuristic ranking rule — brings 45 years of provably-optimal OR theory to a brand-new problem domain.
+Traffic-weighting severity: a rarely-queried contaminated document and a heavily-queried one are NOT equally urgent — this benefit function borrows directly from Zipf-distributed real-world query traffic (Breslau et al., 1999).
+The Defer action is a first-class, mathematically justified choice — not a fallback — deliberately spending zero budget when severity x traffic doesn't clear the cost bar.
+
+Creativity
+VectorSentry  |  Review I
+11
+
+### Notes:
+On novelty: to the fifteen papers we reviewed, nobody has applied a knapsack formulation to vector-database contamination specifically — knapsack optimization is well-established in Operations Research generally, but not in this domain. Nobody offers a three-way action choice either — it's always 'detect it' or 'here's one fix.' And nobody closes the loop with an automated, verified-safe deployment gate. On creativity — the traffic-weighting idea specifically came from recognizing that real query logs are Zipf-distributed, a fact established in 1999 networking literature, and realizing that fact should directly shape which documents get budget first. That's borrowing an insight from a completely different subfield — caching and CDN traffic — and applying it here.
+
+<!-- Slide number: 12 -->
+REAL-WORLD RELEVANCE & FEASIBILITY
+Real-World Relevance & Technical Feasibility
+
+REAL-WORLD RELEVANCE
+TECHNICAL FEASIBILITY
+Every RAG / semantic-search system faces this the moment its embedding provider ships a model update.
+20+ production vector-DB systems now in commercial use (Pinecone, Weaviate, Milvus, Qdrant, pgvector) — Pan et al., 2024 VLDBJ survey.
+OpenAI, Cohere, and open-source embedding models are updated multiple times per year — every update is a contamination event at scale for any system that can't afford a full re-embed.
+Karval & Singh (2023) document 'silent' ML production failures as a distinct, under-addressed category — this project targets exactly that category for vector search.
+Standard, proven components — sentence-transformers, scikit-learn, numpy, an off-the-shelf ILP solver, Streamlit — every planned component is an established, well-documented tool, not a research prototype.
+Bounded compute cost by design — Greedy heuristics for knapsack-structured problems are near-linear time with well-understood approximation bounds relative to the exact ILP solution — the algorithmic basis is sound before we run a single experiment.
+Achievable benchmark scope — A 5,000-document corpus keeps the exact-ILP baseline solvable for direct comparison, while staying large enough to be a meaningful evaluation — deliberately scoped to fit within the year.
+A concrete, de-risked build order — Four independently testable modules (previous slide) give a clear implementation sequence — each can be built and validated before the next depends on it.
+VectorSentry  |  Review I
+12
+
+### Notes:
+This isn't a hypothetical scenario — every production RAG or semantic search system depends on an embedding model that WILL be updated eventually, and Pan et al.'s 2024 survey counts over twenty commercial vector-database systems now deployed. On feasibility, we're not asking you to take it on faith that this can be built — every component is a standard, well-documented tool, the algorithm we're proposing has provable complexity bounds independent of our own implementation, and we've deliberately scoped the benchmark size so the whole build-and-evaluate cycle fits within the year. The four-module breakdown gives us a concrete, de-risked build order, which is exactly what we'll walk through next on the project plan.
+
+<!-- Slide number: 13 -->
+PROJECT PLAN — ONE-YEAR ROADMAP
+Project Plan & Timeline
+
+Literature Survey & Problem Formulation
+
+1
+
+Months 1–2
+Systematic review of 15 sources; root-cause analysis and research-gap identification (what you've seen today).
+
+System Design & Architecture Finalization
+
+2
+
+Months 2–3
+Detailed design of the 4-module pipeline (Detect / Prioritize / Migrate / Verify); benchmark and evaluation-metric design.
+
+Detection Module (M1)
+
+3
+
+Months 3–5
+Implement and tune the KNN-OOD-based contamination detector against a calibrated clean-baseline threshold.
+
+Prioritization Scheduler (M2)
+
+4
+
+Months 5–7
+Implement the MCKP formulation — exact ILP solver plus a frontier-greedy approximation for production scale.
+
+Migration & Verification Pipeline (M3–M4)
+
+5
+
+Months 7–9
+Build the shadow-build, golden-query verification, and atomic cutover/rollback mechanism.
+
+Integration & Benchmark Evaluation
+
+6
+
+Months 9–11
+Run the full pipeline end-to-end on the BEIR SciFact benchmark; head-to-head comparison against naive baselines.
+
+Live Demo, Final Report & Review II
+
+7
+
+Months 11–12
+Autonomous "Live Sentry" proof-of-concept; final report writing and defense preparation.
+
+VectorSentry  |  Review I
+13
+
+### Notes:
+This is our roadmap for the full year, not a status report — nothing here is done yet beyond the literature survey and problem formulation you've already seen today. We've deliberately ordered the build so each module only starts once its predecessor is validated: detection first, since prioritization needs a working detector's output to schedule against; migration and verification last, since they depend on both. The final two months are reserved for integration, evaluation, the live autonomous demo, and writing up the final report — building in slack rather than assuming everything goes right on the first attempt.
+
+<!-- Slide number: 14 -->
+EXPECTED OUTCOMES
+Expected Outcomes & Success Criteria
+These are the outcomes VectorSentry is designed to achieve — targets we will validate empirically over the course of the year, not results we already have.
+
+A reliable, oracle-free detector
+
+1
+Flags mixed-generation contamination without requiring labeled ground truth, at accuracy competitive with established OOD-detection baselines.
+
+A provably near-optimal scheduler
+
+2
+Frontier-greedy prioritization tracks the exact ILP solution closely, so budget is spent close to optimally even at production scale.
+
+Meaningfully better recovery per budget unit
+
+3
+Outperforms naive full-re-embed-everything practice under the same budget, especially at tight budgets where prioritization matters most.
+
+A safety gate that never ships a regression
+
+4
+No remediation plan is deployed if it would regress a protected, high-value query set — verified automatically before every cutover.
+
+HOW WE'LL KNOW IF WE SUCCEEDED
+Each objective from the Objectives & Scope slide has a specific, pre-committed target metric. Review II will report the actual measured numbers against these targets — including where we fall short, not just where we succeed.
+VectorSentry  |  Review I
+14
+
+### Notes:
+These are expected outcomes and success criteria, not results — we're deliberately not presenting numbers today because we haven't run the evaluation yet; that's exactly what the year of Phase II work is for. Each one maps directly to an objective from the Objectives slide: a reliable detector, a near-optimal scheduler, better recovery than naive practice, and a safety gate that never silently regresses production. What we're committing to here is accountability — Review II will show the actual measured numbers against these exact targets, including any that we miss, not a filtered highlight reel.
+
+<!-- Slide number: 15 -->
+REFERENCES
+References (APA)
+All 15 sources — abbreviated per guideline space constraints; full annotated list with problem/method/dataset/findings/limitations in the companion document.
+Breslau, L., Cao, P., Fan, L., Phillips, G., & Shenker, S. (1999). Web caching and Zipf-like distributions: Evidence and implications. IEEE INFOCOM.
+Breunig, M. M., Kriegel, H.-P., Ng, R. T., & Sander, J. (2000). LOF: Identifying density-based local outliers. ACM SIGMOD.
+Fuster Baggetto, A., & Fresno, V. (2022). Is anisotropy truly harmful for dense retrieval? Findings of ACL: EMNLP 2022.
+Hu, Y., Bansal, S., Cao, K., Rao, R., Subbian, K., & Leskovec, J. (2022). Learning backward compatible embeddings. ACM KDD.
+Karval, R., & Singh, A. (2023). Silent failures in machine learning production systems. IEEE Conference Publication.
+Lample, G., Conneau, A., Ranzato, M., Denoyer, L., & Jégou, H. (2018). Word translation without parallel data (MUSE). ICLR.
+Liu, F. T., Ting, K. M., & Zhou, Z.-H. (2008). Isolation forest. IEEE ICDM.
+Lu, J., Yin, W., & Xu, Y. (2024). Recent advances in OOD detection: Problems and approaches. ACM Computing Surveys.
+Malkov, Y. A., & Yashunin, D. A. (2020). Efficient and robust approximate nearest neighbor search using HNSW. IEEE TPAMI.
+Muennighoff, N., Tazi, N., Magne, L., & Reimers, N. (2023). MTEB: Massive text embedding benchmark. ACL.
+Pan, J. J., Wang, J., & Li, G. (2024). Survey of vector database management systems. The VLDB Journal, Springer.
+Sinha, P., & Zoltners, A. A. (1979). The multiple-choice knapsack problem. Operations Research, 27(3).
+Sun, Y., Ming, Y., Zhu, X., & Li, Y. (2022). Out-of-distribution detection with deep nearest neighbors. ICML.
+Vejendla, H. (2025). Drift-Adapter: A lightweight framework for continuous dense retrieval adaptation. EMNLP.
+Wu, K., Wu, E., & Zou, J. (2024). How faithful are RAG models? Quantifying the tug-of-war. arXiv preprint / survey.
+VectorSentry  |  Review I
+15
+
+### Notes:
+The full fifteen-source reference list, in APA format. Every one of these was individually verified against the actual publication — author list, venue, and year — before being included; none were taken from memory without checking. The companion document has the complete annotated version with each paper's problem addressed, methodology, dataset, key findings, and limitations, exactly as the literature-survey guideline requires.

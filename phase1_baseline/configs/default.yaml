@@ -1,0 +1,53 @@
+# Default experiment configuration for Phase 1 (and, via /common, Phase 2).
+#
+# Every value here maps directly to a field in common/src/common/config.py.
+# Edit this file (or copy it to a new name and pass that path) to change
+# contamination ratios, budget levels, or model choices without touching
+# any source code.
+
+seed: 42
+
+corpus:
+  name: scifact # BEIR dataset, loaded from its HuggingFace mirror
+  max_docs: 5000 # keep the pipeline laptop / free-Colab feasible
+
+# Generation A/B: two real, same-dimensional (384) sentence-transformers
+# models standing in for an embedding-provider version upgrade. MiniLM-L12
+# is the same architecture family as MiniLM-L6 (just deeper), chosen as the
+# PRIMARY pair because its embedding-space anisotropy is comparable to
+# MiniLM-L6's -- see configs/aniso_stress_bge.yaml and DEVLOG.md's
+# sub-phase 1C entry for why that comparability matters: pairing MiniLM-L6
+# with a highly anisotropic model (e.g. bge-small-en-v1.5) breaks every
+# baseline detector's core density assumption and is kept as a separate,
+# explicitly-diagnosed stress-test config rather than the main benchmark.
+embedding_models:
+  generation_a: sentence-transformers/all-MiniLM-L6-v2
+  generation_b: sentence-transformers/all-MiniLM-L12-v2
+
+contamination:
+  ratios: [0.05, 0.10, 0.20, 0.35, 0.50]
+
+traffic:
+  distribution: zipf
+  zipf_s: 1.2
+
+index:
+  backend: faiss
+  metric: cosine
+
+budget:
+  levels: [0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+
+detection:
+  knn_k: 10
+  lof_k: 20
+
+remediation:
+  cost_full_reembed: 1.0
+  cost_patch: 0.1
+  calibration_sample_size: 300
+  detector: knn_ood
+
+paths:
+  results_dir: phase1_baseline/results
+  cache_dir: .cache

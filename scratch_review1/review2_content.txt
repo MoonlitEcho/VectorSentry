@@ -1,0 +1,496 @@
+<!-- Slide number: 1 -->
+
+KUMARAGURU COLLEGE OF TECHNOLOGY  •  KSI
+VectorSentry
+Budget-Aware Prioritization for Mixed-Generation Embedding Contamination
+Review II — Built, Tested, and Evaluated
+
+Team Member(s): [Full Name — Register No. — Department]  (add one line per member)
+Guide: [Guide Name, Designation]
+Review Date: [Confirm exact review date]   |   UG Capstone Projects (2026-27) — Phase I, Review II
+Fields in brackets, and the guide-approval proof required by the review circular, must be completed before presenting.
+
+### Notes:
+Good [morning/afternoon]. I'm presenting VectorSentry's Review II — since Review I, we've moved from a proposal to a built, tested, and evaluated system. Today I'll briefly respond to the feedback from Review I, then walk through the literature, the built architecture, real experimental results, how we tested it, and a live demonstration of the system actually running.
+
+<!-- Slide number: 2 -->
+RESPONSE TO REVIEW I FEEDBACK
+Addressing the Panel's Questions
+Three questions from Review I, answered directly — with evidence, not just argument.
+
+“Why is there a paper from the 1900s?”
+
+1
+Sinha & Zoltners (1979) and Breslau et al. (1999) are foundational theory, not stale trivia — the way citing Dijkstra (1959) for shortest-path algorithms wouldn't be “old.” We don't just cite the 1979 knapsack formulation — our scheduler is a direct implementation of it, and we measured it: 0.00% mean optimality gap (max 0.14%) against the exact solver, on the exact instance where a naive approach was 88% wrong. The 45-year-old math holds up empirically, today, on our own data.
+
+“Doesn't this need a lot of overhead?”
+
+2
+Measured, not assumed: Detection scans the full 5,000-document benchmark in under 0.6 seconds (real measured runtime, all three detectors). Migration only shadow-builds the documents actually selected for a fix — not the whole corpus. Verification re-scores a small curated golden-query set, not the full query load. Full breakdown on the Complexity slide next.
+
+“What's the space and time complexity?”
+
+3
+Detection: O(N log N) with an ANN index. Prioritization: O(N log N) for production (frontier-greedy); the exact ILP solver is intentionally kept off the live path, used only for small-scale validation. Migration/Verification: bounded by k (flagged documents), not N (corpus size). Full table, with real measured wall-clock numbers, on the next slide.
+VectorSentry  |  Review II
+2
+
+### Notes:
+Before anything else, I want to directly answer the three questions the panel raised at Review I, because we took them seriously and they shaped what we prioritized building. On the old papers: these are foundational theory, and we didn't just cite the 1979 knapsack paper — we validated it. Our scheduler, built directly on that formulation, measures a 0.00% mean optimality gap against the exact solver, with a max of 0.14%, on exactly the instance where a naive approach was 88% wrong. On overhead: we now have real numbers. Detection scans the full five-thousand-document benchmark in under 0.6 seconds. Migration only touches the documents actually selected for a fix, not the whole corpus. On complexity: full breakdown is next, with real measured wall-clock times alongside the theoretical bounds.
+
+<!-- Slide number: 3 -->
+RECAP — PROBLEM STATEMENT
+The Problem, Briefly Revisited
+Production vector databases silently degrade in retrieval quality when a subset of documents is embedded by a different generation of the embedding model than the rest of the corpus. Cosine similarity is not comparable across generations, so the database keeps returning results — just quietly worse ones, with no exception ever thrown.
+
+Real
+Silent
+Growing
+OpenAI and Cohere have both shipped embedding updates that change internal geometry; teams re-embedding piecemeal create exactly this mix.
+No exceptions, no alerts, no crash logs — the system looks healthy while quietly serving worse results.
+20+ commercial vector-database systems have launched in the past five years (Pan et al., 2024) — every one exposed to this failure mode.
+
+Since Review I:  we've moved from arguing this problem to measuring it. Our own 5,000-document benchmark (detailed ahead) now quantifies exactly how retrieval quality degrades as contamination rises — real data, not projection.
+VectorSentry  |  Review II
+3
+
+### Notes:
+Quick recap for context, since you saw this in depth at Review I: mixed-generation embedding contamination silently degrades retrieval quality, because cosine similarity isn't comparable across two different embedding-model generations. It's real — documented in OpenAI and Cohere's own update history. It's silent — no exceptions, no alerts. And it's growing — over twenty commercial vector-database systems have launched in the last five years, all exposed to this. The key difference from Review I: we've now built the benchmark and measured this directly, which is what the rest of today's presentation is about.
+
+<!-- Slide number: 4 -->
+RESEARCH GAP IDENTIFICATION
+From Literature to Research Gap
+
+Two mature, separate bodies of work: OOD/anomaly detection and cheap embedding realignment.
+Existing research
+OUR CONTRIBUTION
+
+1
+A Multiple-Choice Knapsack formulation — {Full Re-embed, Patch, Defer} per document, one shared budget — solved exactly (ILP) and approximately (greedy), gated by automated shadow-build + verification.
+?
+
+Detect anomalous vectors ? apply ONE fix (full re-embed or one uniform patch) to everyone flagged.
+Common approach
+
+2
+?
+
+Every reviewed fix mechanism is corpus-wide and uniform — none reasons about WHICH document to fix first under a real budget.
+Limitation
+
+3
+
+NOW BUILT & MEASURED
+?
+Every claim on this slide is now backed by a real experiment, not just a design argument — see the results section ahead.
+
+No budget-aware, traffic-informed, per-document prioritization layer exists between 'detect' and 'fix' — and no safety gate ensures a chosen plan doesn't regress production quality before it ships.
+Research gap
+
+4
+VectorSentry  |  Review II
+4
+
+### Notes:
+This is the same research-gap logic from Review I, kept because it's still the spine of the project: detection literature finds anomalies but doesn't say what to do next; patching literature fixes cheaply but uniformly, with no per-document decision under a budget. That gap is exactly a Multiple-Choice Knapsack Problem — which is what we've now actually built and measured, not just proposed.
+
+<!-- Slide number: 5 -->
+DETAILED LITERATURE REVIEW — 1 OF 2
+Literature Review — Detection & Patching
+7 of 15 sources — the papers directly targeting detection or repair of embedding contamination.
+| Source | Core Concept | Gap | How We Address It |
+| --- | --- | --- | --- |
+| Sun et al., 2022 | Non-parametric OOD detection via k-NN distance in embedding space | Detects anomalies only — doesn't decide what to do next | Adapted as our Detection module's core scoring method — now built and measured (see Complexity slide) |
+| Lu et al., 2024 | Taxonomy of OOD-detection methods across ML domains | No treatment of embedding-generation-drift-specific detection | Confirms KNN-OOD as a mature, well-grounded detector choice |
+| Liu et al., 2008 | Isolation Forest — isolates anomalies via random feature-space splits | General-purpose; untested on embedding-space anisotropy | Evaluated as an alternative detector — real F1 comparison ahead |
+| Breunig et al., 2000 | LOF — density-relative local outlier scoring | Same generality gap; heavier compute than KNN-OOD | Second alternative detector — real F1 comparison ahead |
+| Vejendla, 2025 | Drift-Adapter — lightweight learned adapter cheaply realigns embeddings | One uniform fix for the whole corpus — no per-document choice | Adapted as our Patch action, gated by a budget decision |
+| Hu et al., 2022 | Trains new models to stay backward-compatible with old embeddings | Needs control of model training — unusable with third-party APIs | Discussed as a complementary, prevention-side alternative |
+| Lample et al., 2018 | MUSE — orthogonal Procrustes alignment between spaces, no parallel data | Built for cross-lingual spaces; assumes no budget constraint | Theoretical foundation for our Patch action's alignment transform |
+VectorSentry  |  Review II
+5
+
+### Notes:
+These seven sources directly target detecting or repairing embedding contamination. KNN-OOD, Isolation Forest, and LOF detect anomalies but never say what to do once you've found one — we've now built and measured all three as candidate detectors, results ahead. Drift-Adapter and the Backward-Compatible-Embeddings paper both show cheap realignment or avoidance is possible, but each applies one uniform strategy — our Patch action adapts Drift-Adapter's mechanism, gated by our own budget decision. MUSE gives us the underlying alignment math.
+
+<!-- Slide number: 6 -->
+DETAILED LITERATURE REVIEW — 2 OF 2
+Literature Review — Foundational Work
+8 of 15 sources — systems, benchmarking, and Operations-Research foundations our design is built on.
+| Source | Core Concept | Gap | How We Address It |
+| --- | --- | --- | --- |
+| Malkov & Yashunin, 2020 | HNSW — graph index for fast approximate nearest-neighbor search | Assumes a geometrically consistent index — silently broken by contamination | Names exactly why contamination is dangerous for the indexes we target |
+| Pan et al., 2024 | Survey of 20+ vector-database system architectures | No treatment of post-deployment embedding integrity | Evidences real-world scale and relevance of the problem |
+| Muennighoff et al., 2023 | MTEB — unified benchmark for comparing embedding models | Static snapshot; doesn't test mixed-generation drift scenarios | Explains why models churn often — the practical trigger for our problem |
+| Wu et al., 2024 | Quantifies how retrieval quality affects RAG faithfulness | Doesn't address the retrieval-quality-degradation cause itself | Motivates why contamination matters beyond raw metrics |
+| Fuster Baggetto & Fresno, 2022 | Tests whether embedding anisotropy actually harms retrieval | Studied within one generation, not across mixed generations | Motivated our own mixed-generation anisotropy stress test (built — see results) |
+| Sinha & Zoltners, 1979 | Exact formulation for one-choice-per-group allocation under budget | Purely theoretical — never applied to embedding remediation | Mathematical core of Prioritization — now measured at 0.00% mean gap (max 0.14%) |
+| Breslau et al., 1999 | Real web traffic follows a Zipf (highly skewed) distribution | About web objects, not vector-DB query traffic specifically | Grounds the traffic-weighted benefit function used in our built scheduler |
+| Karval & Singh, 2023 | Names 'silent failure' as a distinct, under-monitored ML risk category | General MLOps treatment — not specific to vector databases | Provides the framing our Problem Statement applies directly |
+
+On the two highlighted rows above (1979, 1999): foundational theorems don't expire. We cite them because we implement them — and Sinha & Zoltners' 45-year-old formulation now measures at 0.00% mean optimality gap in our own built scheduler.
+VectorSentry  |  Review II
+6
+
+### Notes:
+These eight are our foundation layer. HNSW explains exactly why contamination is dangerous — it assumes a consistent index geometry that contamination silently breaks. The two rows the Review I panel specifically asked about are Sinha and Zoltners, 1979, and Breslau and colleagues, 1999. We're not citing them as historical curiosities — our scheduler is a direct implementation of the 1979 formulation, and we've now measured it: 0.00% mean optimality gap, max 0.14%, against the exact solver. The math holds up, today, on our own data.
+
+<!-- Slide number: 7 -->
+DATASET DETAILS
+Dataset & Benchmark Construction
+
+Corpus
+EXPERIMENTAL SWEEP
+BEIR SciFact — a real, peer-reviewed IR benchmark with genuine relevance judgments (qrels), not synthetic labels.
+Contamination ratios tested
+5%, 10%, 20%, 35%, 50%
+
+Scale
+Remediation budget levels tested
+5,000 documents — a deliberate subsample that keeps the exact-ILP baseline solvable for direct optimality comparison, while remaining a meaningful evaluation.
+10%, 20%, 30%, 50%, 75%, 100%
+Query traffic model
+
+Zipf-distributed synthetic traffic (Breslau et al., 1999) — a small fraction of documents receive most simulated query volume
+Embedding generations
+Generation A = all-MiniLM-L6-v2, Generation B = all-MiniLM-L12-v2 — two real, open sentence-transformer models, standing in for 'old' and 'new' provider versions.
+Evaluation metrics
+nDCG@10 and Recall@10, both unweighted and traffic-weighted
+
+Reproducibility
+Total evaluated combinations
+Fixed seed (42) across every experiment; fully scripted corpus construction, contamination injection, and evaluation — deterministic and re-runnable.
+5 ratios × 6 budget levels = 30 scenarios per method, run to completion
+VectorSentry  |  Review II
+7
+
+### Notes:
+Dataset details, as required. We use BEIR SciFact — a real, peer-reviewed IR benchmark with genuine relevance judgments, not something we invented. Five thousand documents keeps the exact-ILP baseline solvable for direct comparison while remaining meaningful. Contamination is introduced by re-embedding a controlled subset with a second real embedding model — all-MiniLM-L12-v2 standing in for a 'new' provider generation against all-MiniLM-L6-v2 as the 'old' one. We swept five contamination ratios against six budget levels — thirty scenarios per method, all run to completion, with a fixed seed for full reproducibility. Query traffic is modeled as Zipf-distributed, directly grounded in the Breslau et al. 1999 paper from our literature review — not an arbitrary choice.
+
+<!-- Slide number: 8 -->
+SYSTEM ARCHITECTURE AND WORKFLOW
+System Architecture & Workflow
+
+BUILT & RUNNING
+pass
+
+Live Vector
+Database
+?
+
+Detect
+?
+
+Prioritize
+?
+
+Migrate
+?
+
+Verify
+
+Cutover
+(live)
+
+Rollback
+(unchanged)
+fail — retried
+or deferred
+
+Detect:  KNN-OOD score vs. a stable-baseline-calibrated threshold — no oracle labels used. Built.
+continuous autonomous monitoring — "Live Sentry" — built, running, demonstrated live ahead
+
+Prioritize:  MCKP scheduler: severity × traffic × recovery, one shared budget, exact ILP + frontier greedy. Built.
+
+Migrate:  Shadow-build the selected fix — the live index is never mutated in place. Built.
+
+Verify:  Golden-query canary check against the shadow, with automatic rollback on failure. Built.
+VectorSentry  |  Review II
+8
+
+### Notes:
+This is the architecture as built and currently running — not a proposal anymore. A live vector database feeds Detect, which scores documents against a baseline-calibrated threshold. Prioritize is our knapsack scheduler, deciding full re-embed, patch, or defer for every flagged document. Migrate builds the fix as a shadow copy — the live index is never touched directly. Verify is the safety gate: golden-query canary check, automatic rollback on failure, retry or defer as appropriate. And the whole loop runs autonomously and continuously in our 'Live Sentry' module, which I'll demonstrate live, running, later in this presentation.
+
+<!-- Slide number: 9 -->
+PROPOSED METHODOLOGY AND SOLUTION
+Methodology — Module Breakdown
+Four modules, each with a defined input/output contract — every one implemented, unit-tested, and integrated.
+
+M1
+
+M2
+
+M3
+
+M4
+Detection
+Prioritization
+Migration
+Verification & Cutover
+KNN-OOD scoring vs. a stable-baseline percentile threshold. Evaluated against LOF and Isolation Forest as alternatives.
+MCKP formulation — exact ILP for validation, frontier-greedy for production scale.
+Shadow-builds only the selected documents; live index never mutated in place.
+Golden-query canary evaluation; atomic cutover on pass, automatic rollback/retry/defer on fail.
+
+F1 = 0.51–0.57 across contamination ratios (real, measured)
+0.00% mean optimality gap, max 0.14% (real, measured)
+10/30 scenarios correctly aborted by the safety gate (real, measured)
+Beats best Phase-1 baseline in 18/30 scenarios (real, measured)
+VectorSentry  |  Review II
+9
+
+### Notes:
+Same four-module design from Review I, now with a status update: every module is implemented, unit-tested, and integrated — this isn't a plan anymore. Detection measures F1 between 0.51 and 0.57 across contamination ratios. Prioritization's frontier-greedy approximation measures a 0.00% mean optimality gap, max 0.14%, against the exact solver. Migration and Verification together correctly aborted 10 of 30 test scenarios where a plan would have regressed production quality. And head-to-head, the full system beats the best Phase-1 baseline in 18 of 30 scenarios. Each of those numbers has its own dedicated results slide coming up.
+
+<!-- Slide number: 10 -->
+COMPLEXITY & OVERHEAD ANALYSIS
+Space & Time Complexity
+N = corpus size (5,000). k = flagged/selected documents (k ? N typically). d = embedding dimension. M = baseline set size. Q = golden-query count (small, fixed).
+| Module | Time Complexity | Space Complexity | Measured Overhead (real) |
+| --- | --- | --- | --- |
+| Detection (M1) | O(N log M) with an ANN index | O(N·d) + O(M·d) baseline index | 0.43–0.58s to scan the full 5,000-doc benchmark |
+| Prioritization (M2) — production | O(N log N) — sort-dominated (frontier-greedy) | O(N) | Near-linear; 0.00% mean gap, max 0.14% vs. exact |
+| Prioritization (M2) — exact (offline only) | NP-hard in general; pseudo-polynomial DP / ILP branch-and-bound | O(N·B) | Used only on ?300-doc subsamples — kept off the live path |
+| Migration (M3) | O(k·d) — scales with fixes selected, not corpus size | O(k·d) shadow copy — not a full corpus duplicate | Overhead bounded by contamination scope, not N |
+| Verification (M4) | O(Q·k) — small fixed query set | O(Q) | Cheap — re-scores a curated golden set, not full query load |
+
+The overall system is near-linear in corpus size, by design.  The only super-linear step (exact ILP) is deliberately kept off the production path — used solely for offline validation of the greedy approximation, which is what actually runs live. Space overhead is bounded by k (documents actually being fixed), never a full second copy of the corpus.
+VectorSentry  |  Review II
+10
+
+### Notes:
+This slide is our direct, complete answer to the complexity and overhead questions from Review I. Detection is near-linear with an ANN index — measured at under 0.6 seconds for the full five-thousand-document benchmark, across all three detectors we tested. Prioritization's production path, frontier-greedy, is also near-linear — dominated by a sort. The exact ILP solver IS expensive — NP-hard in general — but we deliberately never run it live; it's an offline validation tool we used on small subsamples to prove the greedy approximation is trustworthy. Migration and Verification both scale with k, the number of documents actually being touched, not N, the corpus size — so the overhead is proportional to how contaminated the corpus actually is, not a fixed tax on every query. Bottom line: the only expensive step is intentionally kept off the live system.
+
+<!-- Slide number: 11 -->
+ANALYSIS AND RESULTS — DETECTION
+Results — Detection Performance
+
+![../phase2_proposed/results/from_phase1_baseline/detection_f1_by_ratio.png](Image0.jpg)
+
+0.51–0.57
+KNN-OOD F1 across all five contamination ratios — our chosen production detector
+
+0.11–0.51
+LOF F1 range — degrades sharply at low contamination, the harder, more realistic case
+
+0.11–0.45
+Isolation Forest F1 range — same weakness at low contamination ratios
+
+0.43–0.58s
+Measured wall-clock time to scan the full 5,000-doc benchmark, per detector, per ratio
+VectorSentry  |  Review II
+11
+
+### Notes:
+Real, measured results, all three candidate detectors evaluated across all five contamination ratios. KNN-OOD is our chosen production detector — F1 between 0.51 and 0.57, consistently the strongest performer, and stable across the whole tested range. LOF and Isolation Forest both degrade sharply at low contamination ratios — F1 as low as 0.11 — which is exactly the harder, more realistic early-incident case, and part of why we selected KNN-OOD. And directly answering the overhead question from Review I: every detector scans the full five-thousand-document benchmark in well under a second.
+
+<!-- Slide number: 12 -->
+ANALYSIS AND RESULTS — PRIORITIZATION
+Results — Scheduler Optimality
+
+![../phase2_proposed/results/balanced_actions_stress_test/scheduler_optimality_gap.png](Image0.jpg)
+
+WHY A STRESS TEST
+In our primary configuration, patch cost is dominated by full re-embed, so both algorithms trivially agree — a 0.00% gap that proves nothing interesting. We deliberately re-tuned the patch-cost parameter to create a genuinely non-trivial three-way trade-off, then re-ran the comparison on an identical instance.
+
+88.00%  mean optimality gap — naive greedy (flat cost-sort)
+0.00%  mean gap, max 0.14% — frontier greedy (production)
+This is the direct, measured answer to Review I's question about the 1979 knapsack paper: the theory holds up empirically, on our own data.
+VectorSentry  |  Review II
+12
+
+### Notes:
+This chart is from a deliberately constructed stress test. Our primary configuration makes patch cost dominated by full re-embed, so naive and frontier greedy trivially agree — not an interesting test. We re-tuned the patch-cost parameter to force a genuinely three-way trade-off, then measured both algorithms against the true optimum from an exact ILP solver, on an identical instance. The naive approach — sorting by flat cost-efficiency — is 88 percent wrong on average. Our production frontier-greedy algorithm is within 0.00% on average, 0.14% at worst. This is our direct answer to the Review I question about the 1979 knapsack paper — we didn't just cite forty-five-year-old theory, we implemented it and measured that it still holds.
+
+<!-- Slide number: 13 -->
+ANALYSIS AND RESULTS — MIGRATION & SAFETY
+Results — Migration & Safety Gate
+
+![../phase2_proposed/results/migration_quality_by_budget.png](Image0.jpg)
+
+10 / 30
+ratio × budget scenarios where the safety gate correctly ABORTED a plan before it could regress production
+
+Cause A
+Fixing an unrelated document shifted the ranking for a different, unrelated query — a real interaction the gate caught
+
+Cause B
+The gate conservatively protected a small canary set from even a minor regression, while a larger aggregate gain (+0.117 nDCG@10 in one case) went undeployed
+VectorSentry  |  Review II
+13
+
+### Notes:
+This chart shows migration quality versus budget across all five contamination ratios, against the oracle-recovery ceiling and the no-remediation floor. The safety gate is not decorative — it fired for real. In ten of thirty tested scenarios, verification correctly aborted a plan before it could ship, for two distinct, diagnosed reasons: sometimes fixing one document shifted the ranking for an unrelated query; sometimes the gate conservatively protected a small canary set from even a minor regression, at the cost of a larger aggregate improvement going undeployed in that scenario. We're disclosing both honestly — this is exactly the evidence the Review II rubric's Testing and Risk Assessment criteria are looking for: not a system that never fails, but one whose failure modes are found, understood, and safely contained.
+
+<!-- Slide number: 14 -->
+ANALYSIS AND RESULTS — HEAD-TO-HEAD
+Results — Head-to-Head vs. Phase-1 Baselines
+
+![../phase2_proposed/results/comparison_quality_by_budget_unweighted.png](Image0.jpg)
+
+18 / 30
+10% budget beats 100%
+10 / 30 losses
+scenarios where VectorSentry's scheduler beats the best Phase-1 baseline (FIFO full re-embed or uniform patch)
+at 50% contamination, our scheduler at just 10% budget (nDCG@10 = 0.538) already exceeds Phase-1's best result even at 100% budget (0.516)
+exactly the scenarios the safety gate aborted — the same gate that makes the system safe to deploy at all
+VectorSentry  |  Review II
+14
+
+### Notes:
+The direct comparison: our scheduler versus both Phase-1 baselines, same benchmark, same budgets. It wins in eighteen of thirty tested scenarios. At the highest contamination ratio we tested — 50% — our scheduler at just 10% of the budget already beats Phase-1's best baseline even when that baseline gets the FULL budget. The honest part: it loses in the other ten, and every single one of those ten is exactly where our own safety gate aborted the plan to protect production quality. We're presenting that as a deliberate, disclosed trade-off — a system willing to sometimes recover less quality in exchange for a hard guarantee against silent regressions is the correct choice for production infrastructure, not a weakness to hide.
+
+<!-- Slide number: 15 -->
+TESTING, VALIDATION & RISK ASSESSMENT
+Testing, Validation & Risk Assessment
+Real reliability issues found through destructive testing at full scale (5,000 docs) — and fixed before this review.
+
+Shrinking-budget-pool stall
+Budget was computed from the shrinking remaining-candidate count each tick, so the absolute budget eventually fell below the cost of even one fix — stalling the incident just short of resolution.
+Fix:  Budget is now sized off a stable reference: the incident's initial flagged count, not the shrinking pool.
+
+1
+
+Repeated re-scheduling of fixed documents
+A document already successfully remediated could be handed to the scheduler again if still flagged by residual noise, winning the zero-benefit tie-break every time and starving genuinely-contaminated documents of budget.
+Fix:  Remediated documents are now tracked with a monotonic flag and excluded from all future scheduling rounds.
+
+2
+
+Infinite verification-retry loop
+Escalating budget on verification failure only helps when scarcity IS the cause. When a fix shifted ranking for an unrelated query, escalating forever stalled the incident permanently at maximum budget.
+Fix:  A MAX_CONSECUTIVE_FAILURES cap now defers the candidate for manual review instead of retrying forever.
+
+3
+These are regression tests in our own test suite today — each bug can never silently reappear.
+VectorSentry  |  Review II
+15
+
+### Notes:
+This is genuine destructive testing, not a checkbox. Running the full system at five-thousand-document scale surfaced three real reliability bugs, none of which showed up in smaller smoke tests. First, a shrinking-budget-pool bug that stalled incidents just short of resolution — fixed by sizing budget off a stable reference count. Second, already-fixed documents could be repeatedly rescheduled, starving genuinely contaminated ones — fixed with a monotonic remediated flag. Third, an infinite retry loop when escalating budget couldn't actually fix the real problem — fixed with a hard cap that defers to manual review instead of looping forever. All three are now permanent regression tests, so they can never silently come back — this is exactly the kind of proactive, layered defense the rubric's Risk Assessment and Testing criteria ask for.
+
+<!-- Slide number: 16 -->
+LIVE DEMONSTRATION
+Live Demo — Live Sentry Autonomous Monitor
+This is not a scripted animation — it's the real system, running live, on the real 5,000-document benchmark.
+
+Database A — Stable
+DEMO WALKTHROUGH
+Flagged documents: 50  (untouched control — baseline noise floor)
+Start the dashboard before this slide — first load takes ~30-40s (one-time model warm-up).
+1
+
+Database B — Live
+Show Database A (untouched control) and Database B (live) both starting Stable.
+2
+
+REMEDIATING
+Click the ONE manual control: "Simulate embedding provider update."
+3
+Flagged documents: 80 ? 52 and falling  |  Budget level: 0.30
+
+Everything after that is autonomous: detection fires, status flips to Alert, the scheduler produces a plan, migration shadow-builds it, verification checks it, and it cuts over live — all on their own.
+4
+Live event log (captured from an actual run):
+[22:07:05] Verification PASSED (golden nDCG 0.462 ? 0.462). Cutover applied.
+[22:07:05] Plan: 28 full re-embeds, 0 patches this tick.
+[22:07:17] Verification PASSED (golden nDCG 0.462 ? 0.462). Cutover applied.
+[22:07:17] Plan: 10 full re-embeds, 0 patches this tick.
+Watch the flagged-document count fall tick by tick until status returns to Resolved.
+5
+Point at the event log — every line is the real system talking, not a script.
+6
+Fallback if the live run misbehaves: this exact sequence, screen-recorded end to end, as backup.
+VectorSentry  |  Review II
+16
+
+### Notes:
+[Switch to the actual running dashboard now.] This is the real system — Database A is an untouched control, Database B is where we simulate an incident. The only manual control on the whole page is this one button. [Click 'Simulate embedding provider update'.] Everything from here is autonomous — I'm not clicking anything else. Detection fires on its own, the scheduler produces a plan on its own, migration and verification run on their own, and the alert clears itself once Database B is back to its baseline. [Narrate the event log as it updates.] Every line here is the real background thread talking — detection scores, the scheduler's plan, verification's pass or fail, cutover confirmation. This is exactly the same detect-prioritize-migrate-verify loop from our architecture slide, actually running, live, in front of you.
+
+<!-- Slide number: 17 -->
+FEASIBILITY ANALYSIS
+Feasibility Analysis — Now Evidence-Based
+At Review I this was an argument. Today it's a measurement.
+
+Standard, proven components — sentence-transformers, scikit-learn, numpy, an off-the-shelf ILP solver, Streamlit — every component is a well-documented tool. No custom infrastructure was needed to reach these results.
+
+Bounded compute cost — proven, not just argued — Detection under 0.6s for the full benchmark; frontier-greedy scheduling near-linear and measured within 0.14% of optimal; migration/verification bounded by contamination scope. Full breakdown on the Complexity slide.
+
+Built end-to-end on a real, non-trivial benchmark — Five thousand documents from BEIR SciFact, thirty ratio-by-budget scenarios run to completion — not a toy example, not a partial prototype.
+
+Autonomous operation demonstrated live — The full detect-alert-schedule-migrate-verify-clear loop just ran in front of you, unattended, after one manual trigger.
+
+A build order that was actually validated by testing — Three real reliability bugs were found and fixed during full-scale testing — evidence the modular, dependency-ordered build plan actually works in practice, not just on paper.
+VectorSentry  |  Review II
+17
+
+### Notes:
+At Review I, feasibility was an argument — standard tools, provable complexity bounds, a de-risked build order. Today, every one of those claims has evidence behind it. The components are still standard, but now we can point to real measured runtimes. The build order wasn't just theoretically de-risked — it was actually tested at full scale, and the three bugs we found and fixed are direct proof the process works. And autonomous operation isn't a diagram anymore — you just watched it run.
+
+<!-- Slide number: 18 -->
+NOVELTY OF THE PROPOSED WORK
+Novelty — Now Validated, Not Just Argued
+
+First application (to our literature) of a Multiple-Choice Knapsack formulation to embedding-contamination remediation — now measured at 0.00% mean optimality gap (max 0.14%) against the exact solver.
+A formal 3-way action space {Full Re-embed, Patch, Defer} where every reviewed prior work offers only a binary or single-fix choice — implemented and exercised across all 30 test scenarios.
+A closed detect ? prioritize ? migrate ? verify loop with an automated safety gate — proven by 10 real, correct aborts in testing, not a theoretical claim.
+
+Novelty
+
+Reframing 'which documents to fix' as a combinatorial-optimization problem rather than a heuristic ranking rule — validated: naive heuristic sorting was 88% wrong; our knapsack-based scheduler was within 0.14%.
+Traffic-weighting severity via a Zipf-distributed traffic model (Breslau et al., 1999) — built into every one of our 30 evaluated scenarios.
+The Defer action as a first-class, mathematically justified choice — actually exercised in the built scheduler's real output across every tested ratio.
+
+Creativity
+VectorSentry  |  Review II
+18
+
+### Notes:
+The novelty and creativity claims from Review I are unchanged in substance, but every one now has empirical evidence behind it, not just design reasoning. The knapsack formulation isn't just 'first to our literature' — we measured it beating a naive alternative by 88 percentage points. The safety gate isn't just a design feature — it fired correctly ten real times in testing. The Defer action isn't just philosophically justified — it's in the real scheduler output across every one of our thirty evaluated scenarios.
+
+<!-- Slide number: 19 -->
+PROJECT STATUS & PATH FORWARD
+Project Status & Path to Final Submission
+
+DONE — WITH REAL, COMMITTED EVIDENCE
+?  Baseline detection & remediation (KNN-OOD/LOF/Isolation Forest; FIFO full re-embed; uniform patch)
+?  MCKP prioritization scheduler — exact ILP + frontier-greedy, validated at 0.00% mean gap (max 0.14%)
+?  Shadow-build migration + golden-query verification, with a safety gate proven by 10 real aborts
+?  Head-to-head evaluation vs. baselines — 18/30 wins, honestly disclosed 10/30 losses
+?  Autonomous "Live Sentry" end-to-end demo — just shown running live
+
+REMAINING BEFORE FINAL SUBMISSION
+?  Production-scale validation beyond 5,000 documents
+?  Integration against a real vector-database API (Pinecone/Weaviate) instead of our own benchmark harness
+?  A second corpus to corroborate findings beyond BEIR SciFact
+?  Final report writing and viva/defense preparation
+VectorSentry  |  Review II
+19
+
+### Notes:
+Where we stand: everything on the top list is done, with real, committed evidence behind it — not just a plan anymore. Detection, the scheduler, the migration-and-verification pipeline, the head-to-head evaluation, and the live autonomous demo you just watched. What's left is scoped and named, not hidden: validating at real production scale, integrating against an actual vector-database API instead of our own harness, corroborating our findings on a second corpus, and writing up the final report. We're being explicit about this so there's no ambiguity about what's proven today versus what's planned before final submission.
+
+<!-- Slide number: 20 -->
+REFERENCES
+References (APA)
+All 15 sources — abbreviated per guideline space constraints; full annotated list in the supporting document.
+Breslau, L., Cao, P., Fan, L., Phillips, G., & Shenker, S. (1999). Web caching and Zipf-like distributions: Evidence and implications. IEEE INFOCOM.
+Breunig, M. M., Kriegel, H.-P., Ng, R. T., & Sander, J. (2000). LOF: Identifying density-based local outliers. ACM SIGMOD.
+Fuster Baggetto, A., & Fresno, V. (2022). Is anisotropy truly harmful for dense retrieval? Findings of ACL: EMNLP 2022.
+Hu, Y., Bansal, S., Cao, K., Rao, R., Subbian, K., & Leskovec, J. (2022). Learning backward compatible embeddings. ACM KDD.
+Karval, R., & Singh, A. (2023). Silent failures in machine learning production systems. IEEE Conference Publication.
+Lample, G., Conneau, A., Ranzato, M., Denoyer, L., & Jégou, H. (2018). Word translation without parallel data (MUSE). ICLR.
+Liu, F. T., Ting, K. M., & Zhou, Z.-H. (2008). Isolation forest. IEEE ICDM.
+Lu, J., Yin, W., & Xu, Y. (2024). Recent advances in OOD detection: Problems and approaches. ACM Computing Surveys.
+Malkov, Y. A., & Yashunin, D. A. (2020). Efficient and robust approximate nearest neighbor search using HNSW. IEEE TPAMI.
+Muennighoff, N., Tazi, N., Magne, L., & Reimers, N. (2023). MTEB: Massive text embedding benchmark. ACL.
+Pan, J. J., Wang, J., & Li, G. (2024). Survey of vector database management systems. The VLDB Journal, Springer.
+Sinha, P., & Zoltners, A. A. (1979). The multiple-choice knapsack problem. Operations Research, 27(3).
+Sun, Y., Ming, Y., Zhu, X., & Li, Y. (2022). Out-of-distribution detection with deep nearest neighbors. ICML.
+Vejendla, H. (2025). Drift-Adapter: A lightweight framework for continuous dense retrieval adaptation. EMNLP.
+Wu, K., Wu, E., & Zou, J. (2024). How faithful are RAG models? Quantifying the tug-of-war. arXiv preprint / survey.
+VectorSentry  |  Review II
+20
+
+### Notes:
+Our full reference list — unchanged from Review I, still fifteen individually verified sources in APA format. Thank you — that's VectorSentry's Review II. I'm happy to take any questions.

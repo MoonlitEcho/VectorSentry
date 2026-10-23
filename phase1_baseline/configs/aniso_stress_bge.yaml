@@ -1,0 +1,54 @@
+# Anisotropy stress-test config -- NOT the main Phase 1 benchmark.
+#
+# Same corpus/seed/ratios as configs/default.yaml, but Generation B is
+# BAAI/bge-small-en-v1.5 instead of MiniLM-L12. This pairing is a genuinely
+# realistic "embedding provider update" scenario (MiniLM -> a modern
+# contrastively-trained model is exactly the kind of upgrade that causes
+# real mixed-generation contamination), but bge-small's embedding space is
+# far more anisotropic than MiniLM's (~0.63 vs ~0.14 mean cosine similarity
+# between unrelated documents), which inverts/nullifies every baseline
+# detector's anomaly signal -- see DEVLOG.md's sub-phase 1C entry for the
+# full diagnosis. Kept as a documented, explicitly-labeled bonus finding
+# rather than folded into the main comparison, so the primary Phase 1 vs
+# Phase 2 story isn't accidentally built on a broken detection baseline.
+#
+# Run with:
+#   python phase1_baseline/scripts/run_detection.py --config phase1_baseline/configs/aniso_stress_bge.yaml
+
+seed: 42
+
+corpus:
+  name: scifact
+  max_docs: 5000
+
+embedding_models:
+  generation_a: sentence-transformers/all-MiniLM-L6-v2
+  generation_b: BAAI/bge-small-en-v1.5
+
+contamination:
+  ratios: [0.05, 0.10, 0.20, 0.35, 0.50]
+
+traffic:
+  distribution: zipf
+  zipf_s: 1.2
+
+index:
+  backend: faiss
+  metric: cosine
+
+budget:
+  levels: [0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+
+detection:
+  knn_k: 10
+  lof_k: 20
+
+remediation:
+  cost_full_reembed: 1.0
+  cost_patch: 0.1
+  calibration_sample_size: 300
+  detector: knn_ood
+
+paths:
+  results_dir: phase1_baseline/results/aniso_stress_bge
+  cache_dir: .cache

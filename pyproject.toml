@@ -1,0 +1,48 @@
+[project]
+name = "vectorsentry"
+version = "0.1.0"
+description = "Detect, prioritize, and remediate mixed-generation embedding contamination in production vector databases"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "sentence-transformers>=3.0",
+    "faiss-cpu>=1.8",
+    "scikit-learn>=1.4",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "matplotlib>=3.8",
+    "plotly>=5.20",
+    "streamlit>=1.35",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "datasets>=2.19",
+    "pulp>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+# --- Packaging layout ------------------------------------------------------
+# The repo has three independent top-level folders (common/, phase1_baseline/,
+# phase2_proposed/) so that Phase 1 can be git-tagged and demoed in total
+# isolation from Phase 2. All three are installed as one editable package
+# here purely for import convenience (`import common`, `import phase1`,
+# `import phase2` from anywhere) -- the folder separation that matters for
+# the two review panels is preserved at the filesystem/git level, not lost
+# by sharing one virtualenv.
+[tool.setuptools]
+package-dir = { "common" = "common/src/common", "phase1" = "phase1_baseline/src/phase1", "phase2" = "phase2_proposed/src/phase2" }
+packages = ["common", "phase1", "phase2"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["phase1_baseline/tests", "phase2_proposed/tests"]
+pythonpath = ["common/src", "phase1_baseline/src", "phase2_proposed/src"]
+# Slow tests that hit real BEIR data + real embedding models are opt-in
+# (`pytest -m integration`), so a routine `pytest` stays fast; CI-style full
+# runs use `pytest -m ""` or explicitly include the marker.
+markers = ["integration: slower tests using real BEIR data and real embedding models"]
+addopts = "-m 'not integration'"

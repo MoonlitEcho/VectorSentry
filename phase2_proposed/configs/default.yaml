@@ -1,0 +1,68 @@
+# Default experiment configuration for Phase 2 (VectorSentry's proposed
+# prioritization scheduler).
+#
+# corpus / embedding_models / contamination / traffic / index / budget /
+# detection / remediation below are IDENTICAL to
+# phase1_baseline/configs/default.yaml on purpose: the head-to-head
+# comparison in 2C is only meaningful if both phases are evaluated against
+# the exact same benchmark, budgets, and contamination ratios (per
+# common/benchmark.py's cache keying, an identical corpus+seed+model-pair
+# here hits the SAME cached benchmark Phase 1 already built -- no
+# re-embedding needed). Only the new `scheduler:` section and `paths` are
+# Phase-2-specific. Do not let these two files drift apart without a reason.
+
+seed: 42
+
+corpus:
+  name: scifact
+  max_docs: 5000
+
+embedding_models:
+  generation_a: sentence-transformers/all-MiniLM-L6-v2
+  generation_b: sentence-transformers/all-MiniLM-L12-v2
+
+contamination:
+  ratios: [0.05, 0.10, 0.20, 0.35, 0.50]
+
+traffic:
+  distribution: zipf
+  zipf_s: 1.2
+
+index:
+  backend: faiss
+  metric: cosine
+
+budget:
+  levels: [0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+
+detection:
+  knn_k: 10
+  lof_k: 20
+
+remediation:
+  cost_full_reembed: 1.0
+  cost_patch: 0.1
+  calibration_sample_size: 300
+  detector: knn_ood
+
+scheduler:
+  recovery_full_reembed: 1.0
+  recovery_patch: 0.064 # empirically measured from Phase 1's 1D results -- see DEVLOG.md
+  recovery_defer: 0.0
+  severity_detector: knn_ood
+  exact_solver_sample_size: 300
+
+migration:
+  golden_query_count: 20
+  regression_tolerance: 0.0
+
+live_sentry:
+  poll_interval_seconds: 4.0
+  injection_batch_fraction: 0.10
+  alert_threshold_percentile: 99.0
+  initial_budget_level: 0.3
+  budget_escalation_step: 0.2
+
+paths:
+  results_dir: phase2_proposed/results
+  cache_dir: .cache
