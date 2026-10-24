@@ -13,10 +13,22 @@ generations, so retrieval quality quietly degrades with no error thrown.
   existing state of the art honestly: unsupervised contamination detection
   (KNN-OOD, LOF, Isolation Forest) plus non-prioritized remediation under a
   budget (FIFO order-of-detection, and a uniform patch transform).
-- **Phase 2** ([`phase2_proposed/`](phase2_proposed/)) adds the novel
-  contribution: a Multiple-Choice Knapsack Problem (MCKP) prioritization
-  layer that decides *what to fix first* under the same budget, and compares
-  head-to-head against Phase 1.
+- **Phase 2** ([`phase2_proposed/`](phase2_proposed/)) adds the proposed
+  system, compared head-to-head against Phase 1 on the same benchmark and
+  budget:
+  - *Detect*: a generation-fingerprint detector that treats the index as a
+    mixture of two embedding populations, using the probe batch an operator
+    dual-embeds anyway (no assumed contamination ratio).
+  - *Prioritize*: a Multiple-Choice Knapsack Problem (MCKP) over full
+    re-embed / patch / defer, with expected benefits built from the
+    detector's probability, impression-log traffic, and patch
+    recovery/harm estimated by replaying the query log.
+  - *Migrate*: a staged, priority-ordered rollout, each wave gated by
+    replaying logged queries against the shadow index; budget from rejected
+    fixes is recycled.
+  - Headline: Phase 2 beats the better Phase 1 baseline in 30/30 ratio x
+    budget combinations, +52% of the recoverable nDCG@10 on average (see
+    [`phase2_proposed/results/README.md`](phase2_proposed/results/README.md)).
 - **[`common/`](common/)** holds the benchmark-generation code and shared
   utilities both phases are evaluated against, so the comparison is fair.
 
@@ -62,14 +74,23 @@ share one virtual environment for convenience.
 ## Reproduction
 
 ```bash
-pytest                                  # fast unit tests (~8s)
+pytest                                  # fast unit tests (~1 min)
 pytest -m integration                   # + slower tests hitting real BEIR data/models
 
 python common/scripts/build_benchmark.py                    # build the shared benchmark (~10-20 min, one-time)
 python phase1_baseline/scripts/run_detection.py             # baseline detectors -> phase1_baseline/results/
 python phase1_baseline/scripts/run_remediation.py           # baseline remediation -> phase1_baseline/results/
-streamlit run phase1_baseline/dashboard.py                  # interactive Phase 1 dashboard
+python phase2_proposed/scripts/run_detection.py             # fingerprint vs. baseline detectors -> phase2_proposed/results/
+python phase2_proposed/scripts/run_scheduler.py             # MCKP schedule + optimality gap
+python phase2_proposed/scripts/run_migration.py             # full pipeline, ablations, gate negative control
+python phase2_proposed/scripts/run_comparison.py            # Phase 1 vs. Phase 2 head-to-head
+python -m streamlit run phase1_baseline/dashboard.py        # interactive Phase 1 dashboard
+python -m streamlit run phase2_proposed/live_sentry_dashboard.py # Phase 2 live dashboard
 ```
+
+Run these commands after activating `.venv` so Streamlit uses the same Python
+environment as the project dependencies. On Windows, the unambiguous form is
+`.venv\\Scripts\\python.exe -m streamlit run ...`.
 
 Each script accepts `--config PATH` to point at a different experiment
 config (e.g. `phase1_baseline/configs/aniso_stress_bge.yaml`, a documented

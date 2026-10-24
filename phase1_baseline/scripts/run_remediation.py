@@ -46,7 +46,7 @@ from common.benchmark import build_benchmark, build_contaminated_ratio, mixed_em
 from common.config import Config, load_config  # noqa: E402
 from common.embeddings import embed_texts  # noqa: E402
 from common.metrics import evaluate_retrieval  # noqa: E402
-from common.patch import apply_patch, fit_patch_transform, sample_calibration_indices  # noqa: E402
+from common.patch import fit_adapter, sample_calibration_indices  # noqa: E402
 from common.seed import set_seed  # noqa: E402
 from phase1.detection import detect_isolation_forest, detect_knn_ood, detect_lof  # noqa: E402
 from phase1.remediation import fifo_remediation_plan  # noqa: E402
@@ -63,14 +63,21 @@ def run_remediation_sweep(cfg: Config) -> pd.DataFrame:
     doc_ids = [d.doc_id for d in benchmark.documents]
     eval_queries = [q for q in benchmark.queries if q.query_id in benchmark.qrels_eval]
     query_embeddings = embed_texts([q.text for q in eval_queries], cfg.embedding_models.generation_a)
+    n_docs = len(benchmark.documents)
 
     # Patch transform is ratio-independent (fixed calibration sample, see
     # common/patch.py) -- fit once, reuse for every ratio and budget level.
     calibration_indices = sample_calibration_indices(
         len(benchmark.documents), cfg.remediation.calibration_sample_size, cfg.seed
     )
-    transform = fit_patch_transform(benchmark.emb_a, benchmark.emb_b, calibration_indices)
-    patched_emb_b = apply_patch(benchmark.emb_b, transform)
+    # The patch is applied to whatever vector is STORED for a document (see
+    # common.patch.Adapter): for a false positive that is its correct
+    # generation-A vector, which the patch then damages. The original
+    # version patched every flagged document with its true generation-B
+    # vector, information no operator has.
+    adapter = fit_adapter(
+        benchmark.emb_a, benchmark.emb_b, calibration_indices, cfg.remediation.adapter, cfg.remediation.ridge_alpha
+    )
 
     detect_fn = DETECTORS[cfg.remediation.detector]
     rows: list[dict] = []
@@ -110,7 +117,10 @@ def run_remediation_sweep(cfg: Config) -> pd.DataFrame:
         )
 
         for budget_level in cfg.budget.levels:
-            budget_units = budget_level * n_flagged * cfg.remediation.cost_full_reembed
+            # Sized from the operator's prevalence estimate round(ratio * N),
+            # the same absolute budget Phase 2 gets. For KNN-OOD this equals
+            # the old n_flagged-based sizing exactly (it flags round(ratio * N)).
+            budget_units = budget_level * round(ratio * n_docs) * cfg.remediation.cost_full_reembed
             t0 = time.time()
 
             fixed_full, spent_full = fifo_remediation_plan(flagged, budget_units, cfg.remediation.cost_full_reembed)
@@ -132,7 +142,7 @@ def run_remediation_sweep(cfg: Config) -> pd.DataFrame:
 
             fixed_patch, spent_patch = fifo_remediation_plan(flagged, budget_units, cfg.remediation.cost_patch)
             emb_patch = mixed.copy()
-            emb_patch[fixed_patch] = patched_emb_b[fixed_patch]
+            emb_patch[fixed_patch] = adapter(mixed[fixed_patch])
             metrics_patch = evaluate_retrieval(
                 emb_patch, doc_ids, eval_queries, query_embeddings, benchmark.qrels_eval, benchmark.query_traffic
             )

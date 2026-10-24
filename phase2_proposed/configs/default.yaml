@@ -26,7 +26,9 @@ contamination:
 
 traffic:
   distribution: zipf
-  zipf_s: 1.2
+  zipf_s: 1.0 # classic Zipf exponent; 1.2 left an effective sample of ~6.5 eval queries
+  doc_signal: impressions # document traffic = position-discounted impressions in the query log
+  impression_depth: 10
 
 index:
   backend: faiss
@@ -43,18 +45,33 @@ remediation:
   cost_full_reembed: 1.0
   cost_patch: 0.1
   calibration_sample_size: 300
+  adapter: ridge # affine B->A map fitted on the probe batch; shared by both phases
+  ridge_alpha: 1.0
   detector: knn_ood
 
 scheduler:
   recovery_full_reembed: 1.0
-  recovery_patch: 0.064 # empirically measured from Phase 1's 1D results -- see DEVLOG.md
+  recovery_patch: 0.064 # fallback only (recovery_source: config); see DEVLOG.md 2A and the Redesign entry
   recovery_defer: 0.0
   severity_detector: knn_ood
+  recovery_source: replay # estimate patch recovery/harm by replaying the query log on the probe batch
+  traffic_floor_fraction: 0.001
   exact_solver_sample_size: 300
 
 migration:
-  golden_query_count: 20
-  regression_tolerance: 0.0
+  golden_query_count: 30 # labelled canary only: train-split queries, disjoint from the evaluation set
+  regression_tolerance: 0.01 # non-inferiority margin on the canary score (total, not per wave)
+  n_waves: 5 # staged, priority-ordered rollout
+  gate_confidence: 0.95 # ship a wave only if it is shown not to be worse beyond the margin
+  bootstrap_samples: 2000
+  bisect_depth: 2
+  canary: replay # shadow-traffic diff vs. pre-incident results on logged non-eval queries
+  canary_queries: 300
+  recycle_rounds: 3 # rolled-back budget is re-planned (rejected patches -> full re-embeds)
+
+fingerprint:
+  k: 10
+  threshold: 0.5
 
 live_sentry:
   poll_interval_seconds: 4.0

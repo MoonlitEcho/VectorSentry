@@ -975,3 +975,151 @@ single, indexed entry point for all of Phase 1 and Phase 2's real,
 already-computed results. Remaining optional item: the 2D stretch goal
 (a third "Database C -- healed via Phase 1 baseline" panel), explicitly
 marked optional in the brief and deferred -- see 2D's entry for why.
+
+---
+
+## 2026-10-24 -- Redesign: realistic detection, action effects, traffic and rollout
+
+**Why:** the owner flagged the metrics as very bad (KNN-OOD F1 ~0.5; Phase 2
+winning only 18/30 combinations, +3.6% of headroom on average; the live
+monitor catching a small fraction of an incident) and asked for the
+architecture to be made as realistic as possible. Before changing anything,
+each weakness was traced to a cause with scratch experiments on the cached
+benchmark.
+
+**Diagnosis -- five root causes, none of them "the idea doesn't work":**
+
+1. **Wrong detection question.** KNN-OOD/LOF/IF ask "is this vector an
+   outlier?" A contaminated index is a *mixture* of two dense populations
+   (the handoff's core claim #1), so contaminated vectors are not outliers
+   once there are enough of them (1C's inversion). But the operator already
+   holds a labelled sample of both populations: the probe batch they
+   dual-embedded to fit the patch. Comparing each stored vector to the probe
+   vectors of BOTH generations (kNN vote) gave F1 0.99+ with no assumed ratio.
+2. **recovery_patch = 0.064 was an artifact, not a property of the patch.**
+   Phase 1's uniform patch was applied to KNN-OOD's flagged set, ~half of it
+   clean documents. Applied to truly contaminated documents, the same
+   Procrustes patch closes 35-50% of the nDCG gap (ridge: 50-63%). And the
+   simulation patched false positives with their generation-B vector -- data
+   no operator has -- which both leaked information and hid that patching a
+   clean vector damages it.
+3. **Traffic leaked evaluation labels and was degenerate.** Document traffic
+   was the summed weight of queries whose *relevance labels* name the
+   document: the scheduler was reading the qrels the evaluation scores on,
+   and 87% of documents had exactly zero traffic. zipf_s = 1.2 also put 37%
+   of the traffic-weighted metric on one query (ESS 6.5 of 300). A real
+   system has impression logs, not labels.
+4. **The gate was all-or-nothing on a tiny canary.** Every one of the 10
+   aborts was a plan that would have raised full-corpus nDCG; a 20-query
+   canary moves in whole-query steps.
+5. **Budget scaled with the detector.** budget_level x n_flagged gives a
+   detector that flags more a bigger budget; fine while both phases used
+   KNN-OOD, unfair once they don't.
+
+**Built (all config-driven, all with unit tests):**
+
+- `phase2/fingerprint.py` -- `FingerprintDetector`: smoothed kNN vote
+  against the probe batch's generation-A and generation-B vectors,
+  P(gen B) > 0.5 flags. Probe documents excluded from reported metrics.
+- `common/patch.py` -- `Adapter` + `fit_adapter` ("ridge": closed-form
+  affine least squares with an L2 penalty and an intercept; "procrustes":
+  the original rotation). The patch is now applied to the STORED vector,
+  shared by both phases. `adapter: ridge` in both configs.
+- `common/data.py` -- `compute_impression_traffic`: logged queries run on
+  the pre-incident index, each top-10 hit credited weight/log2(rank+2).
+  `TrafficConfig.doc_signal: impressions` (qrels kept as an option),
+  `zipf_s: 1.0`. `common/benchmark.py` now embeds every logged query with
+  the serving model (cached `query_emb_a.npy`), persists train+test qrels,
+  and RECOMPUTES traffic from the config on every load (the cache dir was
+  never keyed on zipf_s -- a latent stale-cache bug). A metadata rebuild
+  verifies document order against the cache before trusting positional
+  embeddings.
+- `phase2/calibration.py` -- `estimate_action_effects`: label-free
+  shadow-traffic replay on the probe batch with out-of-fold adapters.
+  recovery_patch = share of a contaminated document's lost impressions a
+  patch restores; harm_patch = damage a patch does to a clean document.
+  Measured: **0.650 / 0.657** (ridge). Procrustes measured 0.16, which is
+  why ridge was chosen -- by the operator's own replay, not by peeking at
+  nDCG.
+- `phase2/scheduler.py` -- expected-benefit MCKP:
+  `Benefit(full) = p * traffic`, `Benefit(patch) = (p * recovery - (1-p) *
+  harm) * traffic`, with a general upper-hull frontier builder (handles
+  negative patch benefit) and `priority_order` for rollout. Because p enters
+  the two actions differently, the "one action dominates everyone"
+  degeneracy of 2A no longer holds by construction.
+- `phase2/migrate.py` -- staged rollout: priority-ordered waves, each
+  verified against a pluggable per-query canary, bisection of rejected
+  waves; `replay_canary_scorer` (default) and `labelled_canary_scorer`.
+- `phase2/pipeline.py` -- one shared pipeline (context, canary, plan,
+  `remediate` with budget recycling) used by the sweep AND Live Sentry.
+- Scripts: `phase2_proposed/scripts/run_detection.py` (new);
+  `run_migration.py` adds three ablations and a negative control;
+  `run_scheduler.py` / `run_comparison.py` use the new benefit model and
+  strategies; budget is `budget_level x round(ratio x N)` everywhere.
+- Live Sentry: fingerprint detection (4 false flags on the clean control
+  instead of a 99th-percentile ~1%), the shared pipeline per tick. The
+  owner's uncommitted dashboard work was kept; only text describing the old
+  detector/gate and the event-log regexes were changed.
+
+**Two gate designs failed before the final one -- found by a negative
+control, not by luck.** After the first staged gate passed 150/150 waves, a
+deliberately harmful plan (patch the most-shown documents the detector says
+are clean; drops nDCG@10 by up to 0.126) was added to `run_migration.py`.
+
+- Gate v1 (reject only on a *convincing* regression, compare each wave with
+  the previous state, bisect on rejection) let **all** of it through:
+  bisection shrank the harmful waves until no single slice was significant,
+  and the slices passed one after another, summing to the full damage.
+- Gate v2 (non-inferiority: ship only if shown not worse than the BEST state
+  so far by more than a 0.01 margin) still used the 30-query labelled
+  canary: it rolled back 15-50% of the harm and, at the same time, rejected
+  many genuinely good fixes. Root cause: 30 queries only see the few dozen
+  documents they retrieve.
+- Gate v3 (final): the same non-inferiority rule, scored by **replaying 300
+  logged non-evaluation queries against the shadow and comparing with their
+  pre-incident results** -- shadow-traffic result diffing, label-free, so it
+  can be large. Rolls back 5,884 / 6,021 harmful patches (quality ends within
+  0.004 of untouched at every ratio), costs 0.003 nDCG on average on the real
+  plans (worst 0.020). Rejected patches are recycled: their budget is
+  re-planned with the patch option removed, so they compete for exact full
+  re-embeds instead.
+
+**Results (all regenerated; see `phase2_proposed/results/README.md`):**
+
+- Detection mean F1: fingerprint **0.996** primary / **0.998** bge-small,
+  vs. KNN-OOD 0.548 / 0.003 (given the true ratio).
+- Phase 1 numbers essentially unchanged by the realism fixes (one cell
+  0.430 -> 0.418, one 0.543 -> 0.544), so the gain is not a weakened
+  baseline.
+- Phase 2 vs. better Phase 1 baseline: **30/30** wins, mean **+0.065
+  nDCG@10 = +52.2% of headroom** (traffic-weighted +47.2%); was 18/30,
+  +3.6%. 50% of headroom reached at budget 0.1-0.2 at every ratio.
+- Ablations (mean % headroom over Phase 1): fingerprint + FIFO +29.5%,
+  KNN-OOD + MCKP +7.1%, combined +52.2%. At budget 0.1 neither alone helps
+  much -- they are complements: prioritization is worthless on a flagged set
+  that is half wrong, and good detection alone is spent in ingestion order.
+- Scheduler: naive greedy 40.3% mean gap vs. frontier 0.01% on the PRIMARY
+  config (previously only the artificial stress config showed a gap).
+- Live Sentry, full benchmark: 500 injected -> 503 flagged -> resolved in 3
+  rounds (~12 s), nDCG@10 0.593 -> 0.645 (clean 0.652); verified in the
+  real dashboard via Streamlit's AppTest (no exceptions; incident report:
+  500 changed, 499 caught, 503 repaired, 1 still differing).
+- 89 unit tests pass (was 74); new `test_redesign_components.py` covers the
+  adapter, impression traffic, fingerprint, replay calibration, expected
+  benefits, frontier vs. exact, priority order and budget recycling.
+
+**Limitations to state plainly:**
+
+- Fingerprinting works because the two generations are different models
+  with different geometry. Two checkpoints of the same model a few steps
+  apart could be much harder; this benchmark does not test that.
+- Everything still needs a probe batch (300 dual-embedded documents, 6% of
+  this small corpus); smaller probe batches were not swept.
+- The replay canary and the impression traffic both assume pre-incident
+  result logs exist. Traffic and evaluation still use the same query
+  population (as production would), but the canary uses only
+  non-evaluation queries.
+- Single seed. The contamination mask is keyed to the corpus seed, so
+  multi-seed runs need a separate mask seed (not yet added).
+- The replay estimates are proxies (impression retention), not nDCG; they
+  are close enough for the scheduler's decisions, not a measurement to quote.

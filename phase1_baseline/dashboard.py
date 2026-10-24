@@ -29,7 +29,7 @@ from common.config import load_config  # noqa: E402
 from common.embeddings import embed_texts  # noqa: E402
 from common.index import build_index, search  # noqa: E402
 from common.metrics import evaluate_retrieval  # noqa: E402
-from common.patch import apply_patch, fit_patch_transform, sample_calibration_indices  # noqa: E402
+from common.patch import fit_adapter, sample_calibration_indices  # noqa: E402
 from common.seed import set_seed  # noqa: E402
 from phase1.detection import DetectionResult, detect_knn_ood, evaluate_detection  # noqa: E402
 from phase1.remediation import fifo_remediation_plan  # noqa: E402
@@ -50,11 +50,12 @@ def load_benchmark():
     return cfg, benchmark
 
 
-@st.cache_resource(show_spinner="Fitting patch transform...")
-def load_patched_embeddings(_benchmark, seed: int, calibration_sample_size: int):
+@st.cache_resource(show_spinner="Fitting patch adapter...")
+def load_adapter(_benchmark, seed: int, calibration_sample_size: int, kind: str, ridge_alpha: float):
+    # Applied to the STORED vector of each patched document (see
+    # common.patch.Adapter), so patching a false positive damages it.
     calibration_indices = sample_calibration_indices(len(_benchmark.documents), calibration_sample_size, seed)
-    transform = fit_patch_transform(_benchmark.emb_a, _benchmark.emb_b, calibration_indices)
-    return apply_patch(_benchmark.emb_b, transform)
+    return fit_adapter(_benchmark.emb_a, _benchmark.emb_b, calibration_indices, kind, ridge_alpha)
 
 
 @st.cache_resource(show_spinner="Embedding eval queries...")
@@ -65,7 +66,9 @@ def load_eval_queries(_benchmark, generation_a_model: str):
 
 
 cfg, benchmark = load_benchmark()
-patched_emb_b = load_patched_embeddings(benchmark, cfg.seed, cfg.remediation.calibration_sample_size)
+adapter = load_adapter(
+    benchmark, cfg.seed, cfg.remediation.calibration_sample_size, cfg.remediation.adapter, cfg.remediation.ridge_alpha
+)
 eval_queries, query_embeddings = load_eval_queries(benchmark, cfg.embedding_models.generation_a)
 doc_ids = [d.doc_id for d in benchmark.documents]
 doc_by_id = {d.doc_id: d for d in benchmark.documents}
@@ -101,7 +104,7 @@ def compute_budget_sweep(ratio: float) -> pd.DataFrame:
 
         fixed_patch, _ = fifo_remediation_plan(flagged, budget_units, cfg.remediation.cost_patch)
         emb_patch = mixed.copy()
-        emb_patch[fixed_patch] = patched_emb_b[fixed_patch]
+        emb_patch[fixed_patch] = adapter(mixed[fixed_patch])
         metrics_patch = evaluate_retrieval(
             emb_patch, doc_ids, eval_queries, query_embeddings, benchmark.qrels_eval, benchmark.query_traffic
         )
@@ -148,7 +151,7 @@ remediated = mixed.copy()
 if strategy == "FIFO full re-embed":
     remediated[fixed] = benchmark.emb_a[fixed]
 else:
-    remediated[fixed] = patched_emb_b[fixed]
+    remediated[fixed] = adapter(mixed[fixed])
 
 # --- Key numbers ---
 col1, col2, col3, col4, col5 = st.columns(5)

@@ -54,6 +54,64 @@ def fit_patch_transform(emb_a: np.ndarray, emb_b: np.ndarray, calibration_indice
     return R
 
 
+class Adapter:
+    """A fitted generation-B -> generation-A embedding adapter: `apply(X)`
+    maps stored vectors through `X @ weight + bias` and re-normalizes.
+
+    Realism note -- the patch is applied to whatever vector is CURRENTLY
+    STORED for a document, never to that document's true generation-B
+    embedding looked up on the side. For a correctly flagged document the
+    two are the same thing. For a false positive (a clean generation-A
+    document the detector wrongly flagged) the stored vector is its
+    generation-A embedding, and patching it pushes a correct vector through
+    a B->A map it was never meant for -- real damage. The original pipeline
+    patched false positives with their (unknowable) generation-B embedding
+    instead, which both leaked information and hid this cost.
+    """
+
+    def __init__(self, kind: str, weight: np.ndarray, bias: np.ndarray):
+        self.kind = kind
+        self.weight = weight.astype(np.float32)
+        self.bias = bias.astype(np.float32)
+
+    def apply(self, stored: np.ndarray) -> np.ndarray:
+        stored = np.atleast_2d(stored)
+        mapped = stored @ self.weight + self.bias
+        norms = np.linalg.norm(mapped, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0  # guard against a degenerate all-zero row
+        return (mapped / norms).astype(np.float32)
+
+    __call__ = apply
+
+
+def fit_adapter(
+    emb_a: np.ndarray, emb_b: np.ndarray, calibration_indices: np.ndarray, kind: str = "ridge", ridge_alpha: float = 1.0
+) -> Adapter:
+    """Fits a B -> A adapter on the probe batch's (generation_a,
+    generation_b) pairs.
+
+    - "procrustes": the orthogonal rotation from `fit_patch_transform`, no
+      bias. Norm-preserving, but a rotation about the origin cannot move
+      generation B's centroid onto generation A's.
+    - "ridge": closed-form affine least squares with an L2 penalty,
+      W = (Bc^T Bc + alpha I)^-1 Bc^T Ac on mean-centred pairs, and a bias
+      that maps B's centroid onto A's. The intercept is what lets it fix
+      the centroid offset a rotation cannot; the penalty keeps a 384x384 map
+      fitted from ~300 pairs from overfitting.
+    """
+    if kind == "procrustes":
+        R = fit_patch_transform(emb_a, emb_b, calibration_indices)
+        return Adapter(kind, R, np.zeros(R.shape[1], dtype=np.float32))
+    if kind == "ridge":
+        A = emb_a[calibration_indices].astype(np.float64)
+        B = emb_b[calibration_indices].astype(np.float64)
+        mu_a, mu_b = A.mean(axis=0), B.mean(axis=0)
+        Ac, Bc = A - mu_a, B - mu_b
+        W = np.linalg.solve(Bc.T @ Bc + ridge_alpha * np.eye(B.shape[1]), Bc.T @ Ac)
+        return Adapter(kind, W, mu_a - mu_b @ W)
+    raise ValueError(f"Unknown adapter kind {kind!r}; expected 'ridge' or 'procrustes'.")
+
+
 def apply_patch(emb_b: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Applies a fitted patch transform to (contaminated) generation-B
     embeddings. This is a PARTIAL fix by construction: a single global

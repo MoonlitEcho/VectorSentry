@@ -11,16 +11,23 @@ This module has NO Streamlit dependency -- `LiveSentryState` and
 `run_one_tick` are plain Python or synthetic embeddings, and swap in a
 real background thread only in the dashboard.
 
-Design choice -- calibrated alert threshold, not an assumed ratio: 1C/2A's
-detectors threshold by an ASSUMED contamination ratio (a real operator's
-rough prevalence estimate from a known migration window). A continuous
-live monitor doesn't have that -- it doesn't know in advance how big the
-next incident will be, if there even is one. So instead: take Database
-A's (known-clean) KNN-OOD score distribution as the "normal" baseline,
-and alert on any Database B document scoring above a high percentile of
-it. This is standard anomaly-monitoring practice (calibrate normal, alert
-on deviation) and is exactly what having a stable control database is
-FOR -- see DEVLOG.md's sub-phase 2D entry.
+Detection -- generation fingerprint, not a percentile of KNN-OOD scores:
+a continuous monitor cannot assume a contamination ratio (it does not know
+how big the next incident is, or whether there is one). The original
+monitor calibrated a 99th-percentile KNN-OOD threshold on Database A, which
+by construction raised ~1% false alarms on ANY database and, on the real
+benchmark, caught only a small fraction of an injected incident (the
+contaminated documents are each other's neighbours, so they look normal).
+It now uses Phase 2's fingerprint detector (phase2/fingerprint.py):
+P(generation B) > 0.5 against the probe batch, which needs no ratio and
+raises almost no false alarms on the clean control. Database A is still
+scored every tick as the control: "back to nominal" means Database B
+flags no more documents than Database A does.
+
+Remediation per tick is the same Phase 2 pipeline the sweep uses
+(phase2/pipeline.py): expected-benefit MCKP, then a staged, verified
+rollout (phase2.migrate.execute_staged_migration), so one bad slice of a
+plan is rolled back without blocking the rest.
 """
 
 from __future__ import annotations
@@ -28,28 +35,30 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import threading
+from typing import Callable
 
 import numpy as np
 
 from common.benchmark import Benchmark, build_benchmark
 from common.config import Config
 from common.data import Query
-from common.embeddings import embed_texts
-from common.patch import apply_patch, fit_patch_transform, sample_calibration_indices
-from phase1.detection import knn_ood_scores
-from phase2.migrate import execute_migration, select_golden_query_indices
-from phase2.scheduler import build_efficient_frontier_segments, compute_severity, solve_greedy
+from phase2.pipeline import Phase2Context, build_canary, build_phase2_context, plan_remediation, remediate
 
 STATUS_STABLE = "stable"
 STATUS_ALERT = "alert"
 STATUS_REMEDIATING = "remediating"
 STATUS_RESOLVED = "resolved"
+STATUS_NEEDS_REVIEW = "needs_review"
 
 # How many consecutive verification failures AT MAXIMUM BUDGET for the same
 # candidate set before the monitor gives up and defers it for manual
 # review, rather than retrying an identical failing plan forever -- see
 # run_one_tick's verification-failure handling.
 MAX_CONSECUTIVE_FAILURES = 3
+
+# Per-tick flagged counts kept for the dashboard's "over time" chart --
+# bounded so a long-running demo doesn't grow memory without limit.
+HISTORY_MAX_POINTS = 400
 
 
 @dataclasses.dataclass
@@ -63,29 +72,30 @@ class LiveSentryContext:
     doc_ids: list[str]
     eval_queries: list[Query]
     query_embeddings: np.ndarray
-    golden_queries: list[Query]
-    golden_query_embeddings: np.ndarray
-    patched_emb_b: np.ndarray
+    canary: Callable[[np.ndarray], np.ndarray]  # per-query gate score for a candidate index (phase2.pipeline.build_canary)
+    canary_description: str
+    canary_size: int  # number of canary queries, for display
+    phase2: Phase2Context  # fingerprint detector, adapter, replay-estimated action effects, traffic
 
 
 def build_context(cfg: Config) -> LiveSentryContext:
     benchmark = build_benchmark(cfg)
     doc_ids = [d.doc_id for d in benchmark.documents]
-    eval_queries = [q for q in benchmark.queries if q.query_id in benchmark.qrels_eval]
-    query_embeddings = embed_texts([q.text for q in eval_queries], cfg.embedding_models.generation_a)
-
-    calibration_indices = sample_calibration_indices(
-        len(benchmark.documents), cfg.remediation.calibration_sample_size, cfg.seed
-    )
-    transform = fit_patch_transform(benchmark.emb_a, benchmark.emb_b, calibration_indices)
-    patched_emb_b = apply_patch(benchmark.emb_b, transform)
-
-    golden_indices = select_golden_query_indices(eval_queries, benchmark.query_traffic, cfg.migration.golden_query_count)
-    golden_queries = [eval_queries[i] for i in golden_indices]
-    golden_query_embeddings = query_embeddings[golden_indices]
+    eval_rows = [i for i, q in enumerate(benchmark.queries) if q.query_id in benchmark.qrels_eval]
+    eval_queries = [benchmark.queries[i] for i in eval_rows]
+    query_embeddings = benchmark.query_emb_a[eval_rows]
+    canary, description = build_canary(cfg, benchmark)
 
     return LiveSentryContext(
-        cfg, benchmark, doc_ids, eval_queries, query_embeddings, golden_queries, golden_query_embeddings, patched_emb_b
+        cfg,
+        benchmark,
+        doc_ids,
+        eval_queries,
+        query_embeddings,
+        canary,
+        description,
+        len(canary(benchmark.emb_a)),
+        build_phase2_context(cfg, benchmark),
     )
 
 
@@ -113,6 +123,9 @@ class LiveSentryState:
         # one fix, stalling forever with a trivially-passing no-op
         # "verification"). Set once, when an incident is first detected.
         self.incident_initial_flagged_count = 0
+        self.incident_injected_count = 0
+        self.incident_initial_remediated_count = 0
+        self.last_incident_summary: dict | None = None
         self.stop_requested = False
         # Tracks which Database B documents have already had a remediation
         # action APPLIED (verification passed) at least once -- realistic
@@ -136,12 +149,23 @@ class LiveSentryState:
         # but logged distinctly as needing manual review, not as fixed.
         self.db_b_deferred = np.zeros(len(self.db_b_embeddings), dtype=bool)
         self.consecutive_verification_failures = 0
+        self.last_verification_before: float | None = None
+        self.last_verification_after: float | None = None
+        self.last_verification_passed: bool | None = None
+        self.last_plan_rows: list[dict] = []
+        self.last_plan_budget = 0.0
+        self.last_plan_cost = 0.0
+        self.last_plan_benefit = 0.0
+        self.last_plan_candidate_count = 0
+        self.demo_initial_budget_level: float | None = None
+        self.demo_regression_tolerance: float | None = None
         # Mutable, lock-protected -- NOT read from Streamlit's session_state
         # by the background thread, which is a plain Python thread with no
         # Streamlit script-run context. The UI's slider calls
         # `set_poll_interval()` instead; `monitor_loop` reads it via
         # `get_poll_interval()`.
         self._poll_interval_seconds = poll_interval_seconds
+        self.history: list[dict] = []
         self._log(STATUS_STABLE, "Live Sentry started. Monitoring Database A (stable) and Database B (live).")
 
     def _log(self, status: str, message: str) -> None:
@@ -149,6 +173,19 @@ class LiveSentryState:
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.event_log.append((timestamp, message))
         self.status = status
+
+    def _record_history(self) -> None:
+        # Caller must already hold self._lock.
+        self.history.append(
+            {
+                "time": datetime.datetime.now(),
+                "tick": self.tick_count,
+                "db_a_flagged": self.last_db_a_flagged,
+                "db_b_flagged": self.last_db_b_flagged,
+                "status": self.status,
+            }
+        )
+        del self.history[:-HISTORY_MAX_POINTS]
 
     def snapshot(self) -> dict:
         """A read-only copy of everything the UI needs to render one frame."""
@@ -163,7 +200,32 @@ class LiveSentryState:
                 "current_budget_level": self.current_budget_level,
                 "poll_interval_seconds": self._poll_interval_seconds,
                 "n_deferred": int(self.db_b_deferred.sum()),
+                "n_remediated": int(self.db_b_remediated_once.sum()),
+                "last_verification_before": self.last_verification_before,
+                "last_verification_after": self.last_verification_after,
+                "last_verification_passed": self.last_verification_passed,
+                "incident_initial_flagged_count": self.incident_initial_flagged_count,
+                "incident_injected_count": self.incident_injected_count,
+                "last_incident_summary": dict(self.last_incident_summary) if self.last_incident_summary else None,
+                "last_plan_rows": list(self.last_plan_rows),
+                "last_plan_budget": self.last_plan_budget,
+                "last_plan_cost": self.last_plan_cost,
+                "last_plan_benefit": self.last_plan_benefit,
+                "last_plan_candidate_count": self.last_plan_candidate_count,
+                "demo_initial_budget_level": self.demo_initial_budget_level,
+                "demo_regression_tolerance": self.demo_regression_tolerance,
+                "history": list(self.history),
             }
+
+    def embedding_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return consistent copies of both live databases for visualization.
+
+        The dashboard uses this to show how the live embedding space moves
+        relative to the untouched control without reading mutable arrays while
+        the monitor thread is applying a cutover.
+        """
+        with self._lock:
+            return self.db_a_embeddings.copy(), self.db_b_embeddings.copy()
 
     def get_poll_interval(self) -> float:
         with self._lock:
@@ -172,6 +234,12 @@ class LiveSentryState:
     def set_poll_interval(self, seconds: float) -> None:
         with self._lock:
             self._poll_interval_seconds = seconds
+
+    def configure_demo(self, initial_budget_level: float, regression_tolerance: float | None) -> None:
+        """Set run-level demo controls before the next incident starts."""
+        with self._lock:
+            self.demo_initial_budget_level = float(np.clip(initial_budget_level, 0.1, 1.0))
+            self.demo_regression_tolerance = regression_tolerance
 
     def inject_contamination(self, ctx: LiveSentryContext, batch_fraction: float, seed: int | None = None) -> int:
         """The ONE manual control: simulates an embedding-provider update
@@ -193,7 +261,19 @@ class LiveSentryState:
             batch = rng.choice(clean_indices, size=batch_size, replace=False)
             self.db_b_embeddings[batch] = ctx.benchmark.emb_b[batch]
             self.incident_active = True
-            self.current_budget_level = ctx.cfg.live_sentry.initial_budget_level
+            self.current_budget_level = (
+                ctx.cfg.live_sentry.initial_budget_level
+                if self.demo_initial_budget_level is None
+                else self.demo_initial_budget_level
+            )
+            self.incident_injected_count = batch_size
+            self.incident_initial_remediated_count = int(self.db_b_remediated_once.sum())
+            self.last_incident_summary = None
+            self.last_plan_rows = []
+            self.last_plan_budget = 0.0
+            self.last_plan_cost = 0.0
+            self.last_plan_benefit = 0.0
+            self.last_plan_candidate_count = 0
             self._log(
                 self.status,
                 f"Simulated embedding provider update: {batch_size} documents in Database B "
@@ -207,24 +287,29 @@ class LiveSentryState:
             self.incident_active = False
             self.current_budget_level = 0.0
             self.incident_initial_flagged_count = 0
+            self.incident_injected_count = 0
+            self.incident_initial_remediated_count = 0
+            self.last_incident_summary = None
             self.last_db_b_flagged = 0
             self.db_b_remediated_once = np.zeros(len(self.db_b_embeddings), dtype=bool)
             self.db_b_deferred = np.zeros(len(self.db_b_embeddings), dtype=bool)
             self.consecutive_verification_failures = 0
+            self.last_verification_before = None
+            self.last_verification_after = None
+            self.last_verification_passed = None
+            self.last_plan_rows = []
+            self.last_plan_budget = 0.0
+            self.last_plan_cost = 0.0
+            self.last_plan_benefit = 0.0
+            self.last_plan_candidate_count = 0
+            self.history = []
             self._log(STATUS_STABLE, "Reset: Database B restored to clean state.")
-
-
-def compute_alert_threshold(clean_embeddings: np.ndarray, k: int, percentile: float) -> float:
-    """Calibrates the alert threshold from Database A's (known-clean) own
-    KNN-OOD score distribution -- see module docstring."""
-    scores = knn_ood_scores(clean_embeddings, k=k)
-    return float(np.percentile(scores, percentile))
 
 
 def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     """One iteration of the autonomous monitor loop: score both databases,
     and if Database B has an active incident, run detection -> schedule ->
-    migrate/verify, applying the result only if verification passes.
+    staged migrate/verify, applying whichever waves pass verification.
     Safe to call repeatedly from a background thread; every state mutation
     goes through `state._lock`.
     """
@@ -233,17 +318,24 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
         db_b = state.db_b_embeddings.copy()
         incident_active = state.incident_active
         budget_level = state.current_budget_level
+        initial_budget_level = (
+            ctx.cfg.live_sentry.initial_budget_level
+            if state.demo_initial_budget_level is None
+            else state.demo_initial_budget_level
+        )
+        regression_tolerance = state.demo_regression_tolerance
 
-    threshold = compute_alert_threshold(db_a, ctx.cfg.detection.knn_k, ctx.cfg.live_sentry.alert_threshold_percentile)
-    scores_a = knn_ood_scores(db_a, k=ctx.cfg.detection.knn_k)
-    n_flagged_a = int(np.sum(scores_a > threshold))
+    detector, threshold = ctx.phase2.detector, ctx.cfg.fingerprint.threshold
+    # Database A is the control: its flag count is the detector's own
+    # false-alarm floor, re-measured every tick.
+    _, flagged_a = detector.flag(db_a, threshold)
+    n_flagged_a = int(flagged_a.sum())
 
     # Score Database B even with no active incident -- its flagged count
     # should reflect reality (its own baseline noise, comparable to A's)
     # rather than being hardcoded, which would misrepresent a resolved
     # database as having literally zero anomalies.
-    scores_b = knn_ood_scores(db_b, k=ctx.cfg.detection.knn_k)
-    flagged_mask = scores_b > threshold
+    p_b, flagged_mask = detector.flag(db_b, threshold)
     flagged_indices = np.flatnonzero(flagged_mask)
     n_flagged_b = len(flagged_indices)
 
@@ -252,6 +344,7 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
             state.last_db_a_flagged = n_flagged_a
             state.last_db_b_flagged = n_flagged_b
             state.tick_count += 1
+            state._record_history()
         return
 
     with state._lock:
@@ -277,6 +370,7 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
         state.last_db_a_flagged = n_flagged_a
         state.last_db_b_flagged = n_flagged_b
         state.tick_count += 1
+        state._record_history()
 
         # "Resolved" is relative to Database A's OWN baseline flagged count,
         # not literally zero: a percentile threshold calibrated from A's
@@ -287,24 +381,45 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
         # incident "active" forever. Comparing against A's own
         # concurrently-measured noise floor is what a real anomaly monitor
         # does, and is what makes "back to nominal" well-defined here.
-        # Additionally: if nothing flagged remains eligible for a FRESH
-        # remediation attempt, further ticks cannot improve things either
-        # -- also resolve, honestly noting why.
-        if n_flagged_b <= n_flagged_a or n_candidates == 0:
+        # If flagged documents remain but none is eligible for a fresh
+        # remediation attempt, the monitor stops safely and reports manual
+        # review. That is deliberately NOT a resolved state.
+        if n_flagged_b <= n_flagged_a:
             state.incident_active = False
             state.current_budget_level = 0.0
-            if n_flagged_b <= n_flagged_a:
-                state._log(STATUS_RESOLVED, "Incident resolved -- Database B back to nominal. Alert cleared.")
-            else:
-                state._log(
-                    STATUS_RESOLVED,
-                    f"All {n_flagged_b} remaining flagged documents have already been remediated or "
-                    f"deferred; consistent with the detector's own baseline noise, not further-fixable "
-                    f"right now. Alert cleared.",
-                )
+            state.last_incident_summary = {
+                "injected": state.incident_injected_count,
+                "initial_flagged": state.incident_initial_flagged_count,
+                "final_flagged": n_flagged_b,
+                "remediated": int(state.db_b_remediated_once.sum()) - state.incident_initial_remediated_count,
+                "deferred": int(state.db_b_deferred.sum()),
+            }
+            state._log(
+                STATUS_RESOLVED,
+                "Detector nominal -- Database B is back within control noise. "
+                "This does not prove every contaminated vector was detected.",
+            )
             return
 
-        if state.status in (STATUS_STABLE, STATUS_RESOLVED):
+        if n_candidates == 0:
+            state.incident_active = False
+            state.current_budget_level = 0.0
+            state.last_incident_summary = {
+                "injected": state.incident_injected_count,
+                "initial_flagged": state.incident_initial_flagged_count,
+                "final_flagged": n_flagged_b,
+                "remediated": int(state.db_b_remediated_once.sum()) - state.incident_initial_remediated_count,
+                "deferred": int(state.db_b_deferred.sum()),
+            }
+            state._log(
+                STATUS_NEEDS_REVIEW,
+                f"Automation paused: Database B still has {n_flagged_b} flagged documents versus "
+                f"{n_flagged_a} in the stable control, but all remaining candidates are deferred or "
+                f"already attempted. Manual review required; this is not a clean resolution.",
+            )
+            return
+
+        if state.status in (STATUS_STABLE, STATUS_RESOLVED, STATUS_NEEDS_REVIEW):
             state._log(STATUS_ALERT, f"ALERT: Database B contamination detected ({n_flagged_b} documents flagged).")
             state.incident_initial_flagged_count = n_flagged_b
 
@@ -315,51 +430,89 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
         )
         incident_initial_flagged_count = max(state.incident_initial_flagged_count, 1)
 
-    severity = compute_severity(scores_b[candidate_indices])
-    traffic = ctx.benchmark.doc_traffic[candidate_indices]
-    segments = build_efficient_frontier_segments(
-        severity,
-        traffic,
-        ctx.cfg.remediation.cost_full_reembed,
-        ctx.cfg.remediation.cost_patch,
-        ctx.cfg.scheduler.recovery_full_reembed,
-        ctx.cfg.scheduler.recovery_patch,
-    )
     # Sized off the STABLE incident_initial_flagged_count, not the
     # shrinking n_candidates -- see LiveSentryState's field comment.
     budget_units = budget_level * incident_initial_flagged_count * ctx.cfg.remediation.cost_full_reembed
-    plan = solve_greedy(segments, n_items=n_candidates, budget=budget_units)
+    cfg = ctx.cfg
+    if regression_tolerance is not None:  # the dashboard's per-run gate setting
+        cfg = dataclasses.replace(cfg, migration=dataclasses.replace(cfg.migration, regression_tolerance=regression_tolerance))
+    # Plan -> staged, verified rollout -> recycle rolled-back budget, exactly
+    # as in the offline sweep (phase2.pipeline.remediate).
+    outcome = remediate(
+        cfg, ctx.phase2, db_b, ctx.benchmark.emb_a, candidate_indices, p_b[candidate_indices], budget_units,
+        ctx.canary, seed=cfg.seed + state.tick_count,
+    )
+    remediation = (
+        outcome.rounds[0][0]
+        if outcome.rounds
+        else plan_remediation(cfg, ctx.phase2, candidate_indices, p_b[candidate_indices], budget_units)
+    )
+    plan = remediation.plan
     n_full = int(np.sum(plan.actions == "full_reembed"))
     n_patch = int(np.sum(plan.actions == "patch"))
 
+    recovery_by_action = {
+        "full_reembed": ctx.cfg.scheduler.recovery_full_reembed,
+        "patch": ctx.phase2.recovery_patch,
+        "defer": ctx.cfg.scheduler.recovery_defer,
+    }
+    segment_by_choice = {}
+    for segment in remediation.segments:
+        segment_by_choice[(segment.local_index, segment.to_action)] = segment
+    plan_rows = []
+    for local_index, action in enumerate(plan.actions):
+        segment = segment_by_choice.get((local_index, action))
+        expected = {
+            "full_reembed": remediation.benefit_full[local_index],
+            "patch": remediation.benefit_patch[local_index],
+        }.get(action, 0.0)
+        plan_rows.append(
+            {
+                "doc_id": ctx.doc_ids[candidate_indices[local_index]],
+                "action": action,
+                # P(contaminated) from the fingerprint detector (the dashboard's "Chance it is broken" column).
+                "severity": float(remediation.p_contaminated[local_index]),
+                "traffic_share": float(ctx.phase2.traffic[candidate_indices[local_index]]),
+                "cost": float(ctx.cfg.remediation.cost_full_reembed if action == "full_reembed" else ctx.cfg.remediation.cost_patch if action == "patch" else 0.0),
+                "expected_recovery": float(recovery_by_action[action]),
+                "expected_benefit": float(expected),
+                "priority_ratio": float(segment.ratio if segment is not None else 0.0),
+            }
+        )
+    plan_rows.sort(key=lambda row: (row["action"] == "defer", -row["priority_ratio"], -row["expected_benefit"]))
+
     with state._lock:
+        state.last_plan_rows = plan_rows
+        state.last_plan_budget = float(budget_units)
+        state.last_plan_cost = float(plan.total_cost)
+        state.last_plan_benefit = float(plan.total_benefit)
+        state.last_plan_candidate_count = n_candidates
         state._log(state.status, f"Plan: {n_full} full re-embeds, {n_patch} patches this tick.")
 
-    report = execute_migration(
-        db_b,
-        ctx.benchmark.emb_a,
-        ctx.patched_emb_b,
-        candidate_indices,
-        plan.actions,
-        ctx.doc_ids,
-        ctx.golden_queries,
-        ctx.golden_query_embeddings,
-        ctx.benchmark.qrels_eval,
-        ctx.benchmark.query_traffic,
-        regression_tolerance=ctx.cfg.migration.regression_tolerance,
-    )
+    acted = bool(outcome.rounds)
+    passed = (not acted) or bool(outcome.applied.any())
+    canary_before = outcome.rounds[0][1].canary_before if acted else None
+    canary_after = outcome.rounds[-1][1].canary_after if acted else None
+    waves = [w for _, report in outcome.rounds for w in report.waves]
 
     with state._lock:
-        if report.verification_passed:
-            state.db_b_embeddings = report.live_embeddings
-            acted_mask = plan.actions != "defer"
-            state.db_b_remediated_once[candidate_indices[acted_mask]] = True
+        state.last_verification_before = canary_before
+        state.last_verification_after = canary_after
+        state.last_verification_passed = passed
+        if passed:
+            state.db_b_embeddings = outcome.live_embeddings
+            state.db_b_remediated_once[candidate_indices[outcome.applied]] = True
             state.consecutive_verification_failures = 0
-            state._log(
-                state.status,
-                f"Verification PASSED (golden nDCG {report.golden_ndcg_before:.3f} -> "
-                f"{report.golden_ndcg_after:.3f}). Cutover applied.",
+            rolled_back = (
+                f" {outcome.n_rolled_back} fix(es) rolled back by the safety check." if outcome.n_rolled_back else ""
             )
+            if acted:
+                state._log(
+                    state.status,
+                    f"Verification PASSED for {sum(w.passed for w in waves)} of {len(waves)} rollout wave(s) "
+                    f"(canary {canary_before:.3f} -> {canary_after:.3f}). Cutover applied: "
+                    f"{outcome.n_full_reembed} re-embedded, {outcome.n_patch} patched.{rolled_back}",
+                )
         else:
             state.consecutive_verification_failures += 1
             # Escalating budget only helps when the abort reason IS budget
@@ -377,21 +530,21 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
             if already_at_max_budget and state.consecutive_verification_failures >= MAX_CONSECUTIVE_FAILURES:
                 state.db_b_deferred[candidate_indices] = True
                 state.consecutive_verification_failures = 0
-                state.current_budget_level = ctx.cfg.live_sentry.initial_budget_level
+                state.current_budget_level = initial_budget_level
                 state._log(
                     state.status,
                     f"Verification failed {MAX_CONSECUTIVE_FAILURES} times in a row at maximum budget for "
                     f"this exact candidate set ({len(candidate_indices)} documents) -- the fix itself, not "
                     f"the budget, is the blocker. Deferring for manual review; budget reset to "
-                    f"{ctx.cfg.live_sentry.initial_budget_level:.2f} for any other documents.",
+                    f"{initial_budget_level:.2f} for any other documents.",
                 )
             else:
                 next_budget = min(1.0, budget_level + ctx.cfg.live_sentry.budget_escalation_step)
                 state.current_budget_level = next_budget
                 state._log(
                     state.status,
-                    f"Verification FAILED (golden nDCG would drop {report.golden_ndcg_before:.3f} -> "
-                    f"{report.golden_ndcg_after:.3f}). Migration ABORTED this tick; "
+                    f"Verification FAILED (canary would drop {canary_before:.3f} -> "
+                    f"{min(w.canary_after for w in waves):.3f}). Migration ABORTED this tick; "
                     f"escalating to budget level {next_budget:.2f} next tick.",
                 )
 

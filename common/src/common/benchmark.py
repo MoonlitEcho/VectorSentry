@@ -3,11 +3,15 @@
 Three-layer cache on disk:
 
   <cache_dir>/benchmark/<corpus>_<max_docs>_<seed>/
-      documents.json, queries.json, qrels_eval.json, doc_traffic.npy
-          -- model-INDEPENDENT: corpus subsample + traffic weights, built once.
+      documents.json, queries.json, qrels_eval.json, qrels_all.json
+          -- model-INDEPENDENT: corpus subsample + relevance labels, built once.
+          (doc_traffic.npy / query_traffic.json are still written for old
+          readers, but traffic is RECOMPUTED from the current config on every
+          load -- see build_benchmark.)
       embeddings/<generation_a_slug>__vs__<generation_b_slug>/
-          emb_a.npy, emb_b.npy
-              -- built once per (corpus, model-pair).
+          emb_a.npy, emb_b.npy, query_emb_a.npy
+              -- built once per (corpus, model-pair). query_emb_a holds every
+                 logged query embedded by the serving model (generation A).
           ratios/r05/mask.npy, index.faiss  (one such dir per contamination ratio)
               -- built once per (corpus, model-pair, ratio), from cheap numpy
                  indexing into emb_a/emb_b, not re-embedding.
@@ -37,11 +41,13 @@ from common.data import (
     Document,
     Query,
     RawBeirData,
+    compute_impression_traffic,
     compute_query_traffic,
     load_beir_dataset,
     subsample_corpus,
+    zipf_query_weights,
 )
-from common.embeddings import embed_documents
+from common.embeddings import embed_documents, embed_texts
 from common.index import build_index
 
 try:
@@ -58,9 +64,18 @@ class Benchmark:
     queries: list[Query]
     qrels_eval: dict[str, set[str]]
     query_traffic: dict[str, float]  # query_id -> Zipfian popularity weight
-    doc_traffic: np.ndarray  # (N,) float32, aligned to `documents`
+    doc_traffic: np.ndarray  # (N,) float32, aligned to `documents` -- see TrafficConfig.doc_signal
     emb_a: np.ndarray  # (N, d) float32, generation-A embeddings for the full corpus
     emb_b: np.ndarray  # (N, d) float32, generation-B embeddings for the full corpus
+    # (n_queries, d) generation-A embeddings of EVERY logged query, aligned to
+    # `queries`. Generation A is the serving model, so this is what the
+    # search system itself would compute for each incoming query. Optional so
+    # small synthetic test benchmarks can omit it.
+    query_emb_a: np.ndarray | None = None
+    # query_id -> relevant doc_ids over ALL qrels splits (train + test). The
+    # train-only part is what the migration gate's canary set is built from,
+    # keeping the canary disjoint from the evaluation queries.
+    qrels_all: dict[str, set[str]] | None = None
 
 
 @dataclasses.dataclass
@@ -103,11 +118,26 @@ def build_benchmark(cfg: Config, force: bool = False) -> Benchmark:
     meta_path = bench_dir / "documents.json"
     query_traffic_path = bench_dir / "query_traffic.json"
 
-    if not force and meta_path.exists() and query_traffic_path.exists():
-        documents, queries, qrels_eval, query_traffic, doc_traffic = _load_metadata(bench_dir)
+    qrels_all_path = bench_dir / "qrels_all.json"
+    # Train+test qrels (needed for the qrels traffic signal and the canary
+    # set) were not persisted by older caches; rebuild the cheap,
+    # model-independent metadata layer in that case. The corpus subsample is
+    # seeded, so document order -- and every cached embedding -- is unchanged.
+    needs_qrels_all = not qrels_all_path.exists()
+    if not force and meta_path.exists() and query_traffic_path.exists() and not needs_qrels_all:
+        documents, queries, qrels_eval, _, _ = _load_metadata(bench_dir)
     else:
         raw = load_beir_dataset(cfg.corpus.name)
         raw = subsample_corpus(raw, cfg.corpus.max_docs, cfg.seed)
+        if meta_path.exists():
+            # Cached embeddings are positional; a rebuilt corpus in any other
+            # order would silently misalign every vector with its document.
+            previous_ids = [d.doc_id for d in _load_metadata(bench_dir)[0]]
+            if previous_ids != [d.doc_id for d in raw.documents]:
+                raise RuntimeError(
+                    f"Rebuilt corpus order differs from the cached one in {bench_dir}; delete that "
+                    "directory to rebuild the benchmark (and its embeddings) from scratch."
+                )
         query_traffic, doc_traffic = compute_query_traffic(raw, cfg.traffic.zipf_s, cfg.seed)
         documents, queries, qrels_eval = raw.documents, raw.queries, raw.qrels_eval
         bench_dir.mkdir(parents=True, exist_ok=True)
@@ -116,6 +146,23 @@ def build_benchmark(cfg: Config, force: bool = False) -> Benchmark:
     embed_dir = _embedding_dir(cfg)
     emb_a = embed_documents(documents, cfg.embedding_models.generation_a, embed_dir / "emb_a.npy")
     emb_b = embed_documents(documents, cfg.embedding_models.generation_b, embed_dir / "emb_b.npy")
+    query_emb_a = embed_texts([q.text for q in queries], cfg.embedding_models.generation_a, embed_dir / "query_emb_a.npy")
+
+    # Traffic is recomputed from the CURRENT config on every load, never read
+    # back from the cache: it is cheap, and the cache directory is not keyed
+    # on zipf_s/doc_signal, so a cached copy could silently belong to a
+    # different traffic setting (the original cache had exactly that bug).
+    query_weights = zipf_query_weights(len(queries), cfg.traffic.zipf_s, cfg.seed)
+    query_traffic = {q.query_id: float(w) for q, w in zip(queries, query_weights)}
+    with qrels_all_path.open("r", encoding="utf-8") as f:
+        qrels_all = {qid: set(docids) for qid, docids in json.load(f).items()}
+    if cfg.traffic.doc_signal == "impressions":
+        doc_traffic = compute_impression_traffic(query_emb_a, query_weights, emb_a, cfg.traffic.impression_depth)
+    elif cfg.traffic.doc_signal == "qrels":
+        raw_view = RawBeirData(documents, queries, qrels_all, qrels_eval)
+        query_traffic, doc_traffic = compute_query_traffic(raw_view, cfg.traffic.zipf_s, cfg.seed)
+    else:
+        raise ValueError(f"Unknown traffic.doc_signal {cfg.traffic.doc_signal!r}; expected 'impressions' or 'qrels'.")
 
     if emb_a.shape[1] != emb_b.shape[1]:
         # A dimension mismatch would make a vector DB reject writes outright
@@ -127,7 +174,7 @@ def build_benchmark(cfg: Config, force: bool = False) -> Benchmark:
             f"for contamination to be silent; got {emb_a.shape[1]} vs {emb_b.shape[1]}."
         )
 
-    return Benchmark(documents, queries, qrels_eval, query_traffic, doc_traffic, emb_a, emb_b)
+    return Benchmark(documents, queries, qrels_eval, query_traffic, doc_traffic, emb_a, emb_b, query_emb_a, qrels_all)
 
 
 def build_contaminated_ratio(
@@ -186,6 +233,8 @@ def _save_metadata(
         json.dump([dataclasses.asdict(q) for q in raw.queries], f)
     with (bench_dir / "qrels_eval.json").open("w", encoding="utf-8") as f:
         json.dump({qid: sorted(docids) for qid, docids in raw.qrels_eval.items()}, f)
+    with (bench_dir / "qrels_all.json").open("w", encoding="utf-8") as f:
+        json.dump({qid: sorted(docids) for qid, docids in raw.qrels_all.items()}, f)
     with (bench_dir / "query_traffic.json").open("w", encoding="utf-8") as f:
         json.dump(query_traffic, f)
     np.save(bench_dir / "doc_traffic.npy", doc_traffic)

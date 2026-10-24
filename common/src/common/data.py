@@ -141,6 +141,16 @@ def subsample_corpus(data: RawBeirData, max_docs: int, seed: int) -> RawBeirData
     return RawBeirData(documents=kept_documents, queries=queries, qrels_all=qrels_all, qrels_eval=qrels_eval)
 
 
+def zipf_query_weights(n_queries: int, zipf_s: float, seed: int) -> np.ndarray:
+    """Zipfian popularity per query, `weight(rank) ~ 1/rank^zipf_s`, with
+    the rank-to-query assignment randomized (seeded) so popularity skew is
+    not an artifact of query ID ordering. Normalized to sum to 1."""
+    rng = np.random.default_rng(seed)
+    ranks = rng.permutation(n_queries) + 1  # 1-indexed Zipf rank, randomly assigned per query
+    query_weight = 1.0 / np.power(ranks, zipf_s)
+    return query_weight / query_weight.sum()
+
+
 def compute_query_traffic(
     data: RawBeirData, zipf_s: float, seed: int
 ) -> tuple[dict[str, float], np.ndarray]:
@@ -163,11 +173,7 @@ def compute_query_traffic(
     spread across several relevant documents and one document can
     accumulate weight from several queries).
     """
-    n_queries = len(data.queries)
-    rng = np.random.default_rng(seed)
-    ranks = rng.permutation(n_queries) + 1  # 1-indexed Zipf rank, randomly assigned per query
-    query_weight = 1.0 / np.power(ranks, zipf_s)
-    query_weight /= query_weight.sum()
+    query_weight = zipf_query_weights(len(data.queries), zipf_s, seed)
 
     query_traffic = {q.query_id: float(w) for q, w in zip(data.queries, query_weight)}
     doc_index = {d.doc_id: i for i, d in enumerate(data.documents)}
@@ -183,3 +189,35 @@ def compute_query_traffic(
                 doc_traffic[idx] += w
 
     return query_traffic, doc_traffic.astype(np.float32)
+
+
+def compute_impression_traffic(
+    query_embeddings: np.ndarray,
+    query_weights: np.ndarray,
+    doc_embeddings: np.ndarray,
+    depth: int = 10,
+) -> np.ndarray:
+    """Per-document traffic from simulated IMPRESSION logs -- the realistic
+    replacement for the qrels-derived traffic above (see TrafficConfig).
+
+    Every logged query (row of `query_embeddings`, popularity
+    `query_weights`) is run against `doc_embeddings` -- the pre-incident
+    serving index -- and each document in its top-`depth` results is
+    credited `weight / log2(rank + 2)`, the standard position-bias discount
+    (results lower on the page are seen less). This is exactly what a
+    production search system's impression log records, and it needs no
+    relevance labels: a document's priority comes from how often users are
+    actually SHOWN it, not from which documents an evaluation set happens to
+    label relevant.
+    """
+    scores = query_embeddings @ doc_embeddings.T
+    depth = min(depth, doc_embeddings.shape[0])
+    top = np.argpartition(-scores, depth - 1, axis=1)[:, :depth]
+    # argpartition leaves the top-`depth` unordered; sort each row by score.
+    order = np.argsort(-np.take_along_axis(scores, top, axis=1), axis=1)
+    top = np.take_along_axis(top, order, axis=1)
+
+    discount = 1.0 / np.log2(np.arange(depth) + 2)
+    doc_traffic = np.zeros(doc_embeddings.shape[0], dtype=np.float64)
+    np.add.at(doc_traffic, top.ravel(), (query_weights[:, None] * discount[None, :]).ravel())
+    return doc_traffic.astype(np.float32)
