@@ -85,7 +85,8 @@ python phase2_proposed/scripts/run_scheduler.py             # MCKP schedule + op
 python phase2_proposed/scripts/run_migration.py             # full pipeline, ablations, gate negative control
 python phase2_proposed/scripts/run_comparison.py            # Phase 1 vs. Phase 2 head-to-head
 python -m streamlit run phase1_baseline/dashboard.py        # interactive Phase 1 dashboard
-python -m streamlit run phase2_proposed/live_sentry_dashboard.py # Phase 2 live dashboard
+python phase2_proposed/web_app.py                           # Phase 2 live demo (web UI) -> http://localhost:8600
+python -m streamlit run phase2_proposed/live_sentry_dashboard.py # Phase 2 live dashboard (Streamlit fallback)
 ```
 
 Run these commands after activating `.venv` so Streamlit uses the same Python

@@ -42,6 +42,7 @@ import numpy as np
 from common.benchmark import Benchmark, build_benchmark
 from common.config import Config
 from common.data import Query
+from phase2.migrate import execute_staged_migration
 from phase2.pipeline import Phase2Context, build_canary, build_phase2_context, plan_remediation, remediate
 
 STATUS_STABLE = "stable"
@@ -148,6 +149,10 @@ class LiveSentryState:
         # max budget. Excluded from scheduling like db_b_remediated_once,
         # but logged distinctly as needing manual review, not as fixed.
         self.db_b_deferred = np.zeros(len(self.db_b_embeddings), dtype=bool)
+        # Documents whose live vector is a quick patch, an interim fix. Once an
+        # incident is resolved the monitor upgrades them to exact re-embeds in
+        # the background (see run_one_tick), busiest first.
+        self.db_b_patched = np.zeros(len(self.db_b_embeddings), dtype=bool)
         self.consecutive_verification_failures = 0
         self.last_verification_before: float | None = None
         self.last_verification_after: float | None = None
@@ -159,6 +164,18 @@ class LiveSentryState:
         self.last_plan_candidate_count = 0
         self.demo_initial_budget_level: float | None = None
         self.demo_regression_tolerance: float | None = None
+        # For the dashboard's charts: the live database's search health (the
+        # canary score -- share of pre-incident results its logged queries
+        # still get back, 1.0 = healthy), the latest rollout's per-batch
+        # safety-check results, and the budget spent so far this incident.
+        self.last_health: float | None = None
+        # Which live documents the detector flagged on the latest check (for the web UI's index map).
+        self.last_flagged_b = np.zeros(len(self.db_b_embeddings), dtype=bool)
+        self.last_waves: list[dict] = []
+        self.incident_budget_spent = 0.0
+        # Every repair round's plan (rows, budget, waves) this incident, so the
+        # dashboard can step through the decisions after the fact.
+        self.incident_rounds: list[dict] = []
         # Mutable, lock-protected -- NOT read from Streamlit's session_state
         # by the background thread, which is a plain Python thread with no
         # Streamlit script-run context. The UI's slider calls
@@ -182,6 +199,9 @@ class LiveSentryState:
                 "tick": self.tick_count,
                 "db_a_flagged": self.last_db_a_flagged,
                 "db_b_flagged": self.last_db_b_flagged,
+                "health": self.last_health,
+                "n_remediated": int(self.db_b_remediated_once.sum()),
+                "budget_spent": self.incident_budget_spent,
                 "status": self.status,
             }
         )
@@ -201,6 +221,7 @@ class LiveSentryState:
                 "poll_interval_seconds": self._poll_interval_seconds,
                 "n_deferred": int(self.db_b_deferred.sum()),
                 "n_remediated": int(self.db_b_remediated_once.sum()),
+                "n_patched": int(self.db_b_patched.sum()),
                 "last_verification_before": self.last_verification_before,
                 "last_verification_after": self.last_verification_after,
                 "last_verification_passed": self.last_verification_passed,
@@ -215,6 +236,10 @@ class LiveSentryState:
                 "demo_initial_budget_level": self.demo_initial_budget_level,
                 "demo_regression_tolerance": self.demo_regression_tolerance,
                 "history": list(self.history),
+                "last_health": self.last_health,
+                "last_waves": list(self.last_waves),
+                "incident_budget_spent": self.incident_budget_spent,
+                "incident_rounds": list(self.incident_rounds),
             }
 
     def embedding_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
@@ -268,6 +293,9 @@ class LiveSentryState:
             )
             self.incident_injected_count = batch_size
             self.incident_initial_remediated_count = int(self.db_b_remediated_once.sum())
+            self.incident_budget_spent = 0.0
+            self.last_waves = []
+            self.incident_rounds = []
             self.last_incident_summary = None
             self.last_plan_rows = []
             self.last_plan_budget = 0.0
@@ -293,6 +321,7 @@ class LiveSentryState:
             self.last_db_b_flagged = 0
             self.db_b_remediated_once = np.zeros(len(self.db_b_embeddings), dtype=bool)
             self.db_b_deferred = np.zeros(len(self.db_b_embeddings), dtype=bool)
+            self.db_b_patched = np.zeros(len(self.db_b_embeddings), dtype=bool)
             self.consecutive_verification_failures = 0
             self.last_verification_before = None
             self.last_verification_after = None
@@ -303,6 +332,9 @@ class LiveSentryState:
             self.last_plan_benefit = 0.0
             self.last_plan_candidate_count = 0
             self.history = []
+            self.last_waves = []
+            self.incident_budget_spent = 0.0
+            self.incident_rounds = []
             self._log(STATUS_STABLE, "Reset: Database B restored to clean state.")
 
 
@@ -338,13 +370,19 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     p_b, flagged_mask = detector.flag(db_b, threshold)
     flagged_indices = np.flatnonzero(flagged_mask)
     n_flagged_b = len(flagged_indices)
+    health = float(np.mean(ctx.canary(db_b)))
 
     if not incident_active:
         with state._lock:
+            state.last_health = health
+            state.last_flagged_b = flagged_mask
             state.last_db_a_flagged = n_flagged_a
             state.last_db_b_flagged = n_flagged_b
             state.tick_count += 1
             state._record_history()
+            patched = np.flatnonzero(state.db_b_patched)
+        if len(patched):
+            _upgrade_patches(state, ctx, db_b, patched, initial_budget_level)
         return
 
     with state._lock:
@@ -367,6 +405,8 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     n_candidates = len(candidate_indices)
 
     with state._lock:
+        state.last_health = health
+        state.last_flagged_b = flagged_mask
         state.last_db_a_flagged = n_flagged_a
         state.last_db_b_flagged = n_flagged_b
         state.tick_count += 1
@@ -459,6 +499,13 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     segment_by_choice = {}
     for segment in remediation.segments:
         segment_by_choice[(segment.local_index, segment.to_action)] = segment
+    # Raw impression traffic credits every one of a query's 10 results, so it
+    # sums to ~4.5 across the corpus, not 1 -- normalize before calling it a
+    # share. "x average" stays readable across the long tail, where shares
+    # are thousandths of a percent.
+    traffic_total = float(ctx.phase2.traffic.sum())
+    traffic_mean = float(ctx.phase2.traffic.mean())
+    rollout_rank = {int(local): rank for rank, local in enumerate(remediation.rollout_order, start=1)}
     plan_rows = []
     for local_index, action in enumerate(plan.actions):
         segment = segment_by_choice.get((local_index, action))
@@ -472,7 +519,10 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
                 "action": action,
                 # P(contaminated) from the fingerprint detector (the dashboard's "Chance it is broken" column).
                 "severity": float(remediation.p_contaminated[local_index]),
-                "traffic_share": float(ctx.phase2.traffic[candidate_indices[local_index]]),
+                "traffic_share": float(ctx.phase2.traffic[candidate_indices[local_index]]) / traffic_total,
+                "traffic_vs_average": float(ctx.phase2.traffic[candidate_indices[local_index]]) / traffic_mean,
+                "rollout_rank": rollout_rank.get(local_index),  # 1 = shipped in the first wave; None = deferred
+                "doc_index": int(candidate_indices[local_index]),
                 "cost": float(ctx.cfg.remediation.cost_full_reembed if action == "full_reembed" else ctx.cfg.remediation.cost_patch if action == "patch" else 0.0),
                 "expected_recovery": float(recovery_by_action[action]),
                 "expected_benefit": float(expected),
@@ -499,9 +549,28 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
         state.last_verification_before = canary_before
         state.last_verification_after = canary_after
         state.last_verification_passed = passed
+        state.incident_budget_spent += outcome.cost_spent
+        state.last_waves = [
+            {
+                "round": round_number,
+                "wave": w.wave,
+                "depth": w.depth,
+                "n_documents": w.n_documents,
+                "passed": w.passed,
+                "canary_before": w.canary_before,
+                "canary_after": w.canary_after,
+            }
+            for round_number, (_, report) in enumerate(outcome.rounds, start=1)
+            for w in report.waves
+        ]
+        if plan_rows:
+            state.incident_rounds.append(
+                {"rows": plan_rows, "budget": float(budget_units), "waves": list(state.last_waves)}
+            )
         if passed:
             state.db_b_embeddings = outcome.live_embeddings
             state.db_b_remediated_once[candidate_indices[outcome.applied]] = True
+            state.db_b_patched[candidate_indices[outcome.action_applied == "patch"]] = True
             state.consecutive_verification_failures = 0
             rolled_back = (
                 f" {outcome.n_rolled_back} fix(es) rolled back by the safety check." if outcome.n_rolled_back else ""
@@ -547,6 +616,42 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
                     f"{min(w.canary_after for w in waves):.3f}). Migration ABORTED this tick; "
                     f"escalating to budget level {next_budget:.2f} next tick.",
                 )
+
+
+def _upgrade_patches(
+    state: LiveSentryState, ctx: LiveSentryContext, db_b: np.ndarray, patched: np.ndarray, budget_level: float
+) -> None:
+    """Post-incident clean-up: a quick patch is an interim mitigation (close
+    to the right vector, not exact), so once the incident is resolved the
+    monitor replaces patches with exact re-embeds, busiest documents first,
+    one round's budget per tick, through the same verified staged rollout."""
+    per_tick = max(1, int(round(budget_level * max(state.incident_initial_flagged_count, 1))))
+    order = patched[np.argsort(-ctx.phase2.traffic[patched])][:per_tick]
+    report = execute_staged_migration(
+        db_b, ctx.benchmark.emb_a, ctx.phase2.adapter, order, np.full(len(order), "full_reembed", dtype=object),
+        np.arange(len(order)), ctx.canary,
+        n_waves=ctx.cfg.migration.n_waves,
+        regression_tolerance=ctx.cfg.migration.regression_tolerance,
+        gate_confidence=ctx.cfg.migration.gate_confidence,
+        bootstrap_samples=ctx.cfg.migration.bootstrap_samples,
+        bisect_depth=ctx.cfg.migration.bisect_depth,
+        seed=ctx.cfg.seed + state.tick_count,
+    )
+    with state._lock:
+        if state.incident_active:  # a new incident started meanwhile; leave this for later
+            return
+        state.db_b_embeddings = report.live_embeddings
+        state.db_b_patched[order[report.applied]] = False
+        # Nothing to gain from retrying an exact re-embed the gate rejected.
+        state.db_b_patched[order[~report.applied]] = False
+        state.incident_budget_spent += report.n_full_reembed * ctx.cfg.remediation.cost_full_reembed
+        if report.n_full_reembed:
+            state._log(
+                state.status,
+                f"Clean-up: upgraded {report.n_full_reembed} patched documents to exact re-embeds "
+                f"(canary {report.canary_before:.3f} -> {report.canary_after:.3f}); "
+                f"{int(state.db_b_patched.sum())} patches left.",
+            )
 
 
 def monitor_loop(state: LiveSentryState, ctx: LiveSentryContext) -> None:
