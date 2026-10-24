@@ -57,6 +57,9 @@ STATUS_NEEDS_REVIEW = "needs_review"
 # run_one_tick's verification-failure handling.
 MAX_CONSECUTIVE_FAILURES = 3
 
+# Clean-up retries per patched document before it is left on its patch.
+MAX_UPGRADE_ATTEMPTS = 3
+
 # Per-tick flagged counts kept for the dashboard's "over time" chart --
 # bounded so a long-running demo doesn't grow memory without limit.
 HISTORY_MAX_POINTS = 400
@@ -153,6 +156,11 @@ class LiveSentryState:
         # incident is resolved the monitor upgrades them to exact re-embeds in
         # the background (see run_one_tick), busiest first.
         self.db_b_patched = np.zeros(len(self.db_b_embeddings), dtype=bool)
+        # How many times the clean-up's exact re-embed of a patched document
+        # has been rolled back; it is retried on later ticks, up to
+        # MAX_UPGRADE_ATTEMPTS, because a rejection is usually transient
+        # (other still-patched documents briefly shift the logged results).
+        self.db_b_upgrade_attempts = np.zeros(len(self.db_b_embeddings), dtype=np.int16)
         self.consecutive_verification_failures = 0
         self.last_verification_before: float | None = None
         self.last_verification_after: float | None = None
@@ -322,6 +330,7 @@ class LiveSentryState:
             self.db_b_remediated_once = np.zeros(len(self.db_b_embeddings), dtype=bool)
             self.db_b_deferred = np.zeros(len(self.db_b_embeddings), dtype=bool)
             self.db_b_patched = np.zeros(len(self.db_b_embeddings), dtype=bool)
+            self.db_b_upgrade_attempts = np.zeros(len(self.db_b_embeddings), dtype=np.int16)
             self.consecutive_verification_failures = 0
             self.last_verification_before = None
             self.last_verification_after = None
@@ -380,6 +389,10 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
             state.last_db_b_flagged = n_flagged_b
             state.tick_count += 1
             state._record_history()
+            if state.status == STATUS_NEEDS_REVIEW and n_flagged_b <= n_flagged_a and not state.db_b_deferred.any():
+                if state.last_incident_summary:
+                    state.last_incident_summary["final_flagged"] = n_flagged_b
+                state._log(STATUS_RESOLVED, "Detector nominal -- the clean-up cleared the remaining flagged documents.")
             patched = np.flatnonzero(state.db_b_patched)
         if len(patched):
             _upgrade_patches(state, ctx, db_b, patched, initial_budget_level)
@@ -388,6 +401,7 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     with state._lock:
         already_remediated = state.db_b_remediated_once.copy()
         deferred = state.db_b_deferred.copy()
+        patched_now = state.db_b_patched.copy()
 
     # Only documents flagged, never yet remediated, and not given up on
     # are real scheduling candidates:
@@ -401,7 +415,13 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     #   even at maximum budget -- see the verification-failure handling
     #   below for why retrying it forever would otherwise be a no-op.
     # See DEVLOG.md's sub-phase 2D entry for the real runs that exposed both.
-    candidate_indices = np.flatnonzero(flagged_mask & ~already_remediated & ~deferred)
+    # Exception: a document carrying a quick PATCH that the detector still
+    # flags is not a no-op to fix again -- an exact re-embed would cure it --
+    # so it stays a candidate, with the patch option withheld. (Excluding it
+    # paused a real Tight-budget run for "human review" with 51 such
+    # documents left.)
+    retry_patched = already_remediated & patched_now
+    candidate_indices = np.flatnonzero(flagged_mask & ~deferred & (~already_remediated | retry_patched))
     n_candidates = len(candidate_indices)
 
     with state._lock:
@@ -480,7 +500,7 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     # as in the offline sweep (phase2.pipeline.remediate).
     outcome = remediate(
         cfg, ctx.phase2, db_b, ctx.benchmark.emb_a, candidate_indices, p_b[candidate_indices], budget_units,
-        ctx.canary, seed=cfg.seed + state.tick_count,
+        ctx.canary, seed=cfg.seed + state.tick_count, allow_patch=~patched_now[candidate_indices],
     )
     remediation = (
         outcome.rounds[0][0]
@@ -571,6 +591,7 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
             state.db_b_embeddings = outcome.live_embeddings
             state.db_b_remediated_once[candidate_indices[outcome.applied]] = True
             state.db_b_patched[candidate_indices[outcome.action_applied == "patch"]] = True
+            state.db_b_patched[candidate_indices[outcome.action_applied == "full_reembed"]] = False
             state.consecutive_verification_failures = 0
             rolled_back = (
                 f" {outcome.n_rolled_back} fix(es) rolled back by the safety check." if outcome.n_rolled_back else ""
@@ -626,7 +647,11 @@ def _upgrade_patches(
     monitor replaces patches with exact re-embeds, busiest documents first,
     one round's budget per tick, through the same verified staged rollout."""
     per_tick = max(1, int(round(budget_level * max(state.incident_initial_flagged_count, 1))))
-    order = patched[np.argsort(-ctx.phase2.traffic[patched])][:per_tick]
+    # Fewest failed attempts first, then busiest, so a document whose
+    # re-embed was just rejected waits behind ones not yet tried.
+    with state._lock:
+        attempts = state.db_b_upgrade_attempts[patched].copy()
+    order = patched[np.lexsort((-ctx.phase2.traffic[patched], attempts))][:per_tick]
     report = execute_staged_migration(
         db_b, ctx.benchmark.emb_a, ctx.phase2.adapter, order, np.full(len(order), "full_reembed", dtype=object),
         np.arange(len(order)), ctx.canary,
@@ -642,8 +667,9 @@ def _upgrade_patches(
             return
         state.db_b_embeddings = report.live_embeddings
         state.db_b_patched[order[report.applied]] = False
-        # Nothing to gain from retrying an exact re-embed the gate rejected.
-        state.db_b_patched[order[~report.applied]] = False
+        rejected = order[~report.applied]
+        state.db_b_upgrade_attempts[rejected] += 1
+        state.db_b_patched[rejected[state.db_b_upgrade_attempts[rejected] >= MAX_UPGRADE_ATTEMPTS]] = False
         state.incident_budget_spent += report.n_full_reembed * ctx.cfg.remediation.cost_full_reembed
         if report.n_full_reembed:
             state._log(

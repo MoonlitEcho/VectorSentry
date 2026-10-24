@@ -221,6 +221,7 @@ def remediate(
     budget_units: float,
     canary: Callable[[np.ndarray], np.ndarray],
     seed: int = 0,
+    allow_patch: np.ndarray | None = None,
 ) -> RemediationOutcome:
     """Plan -> staged, verified rollout -> recycle, for up to
     `migration.recycle_rounds` rounds.
@@ -231,7 +232,9 @@ def remediate(
     for a full re-embed instead (an exact restoration, so it cannot push
     other documents out of their logged results); a document whose full
     re-embed was rejected is left alone. Repeats until nothing is rolled
-    back, the budget is spent, or the round limit is hit.
+    back, the budget is spent, or the round limit is hit. `allow_patch`
+    (aligned to candidate_indices) withholds the patch option up front, e.g.
+    for documents already carrying a patch the detector still flags.
     """
     candidate_indices = np.asarray(candidate_indices, dtype=int)
     p_contaminated = np.asarray(p_contaminated, dtype=np.float64)
@@ -239,7 +242,7 @@ def remediate(
     live = stored
     applied = np.zeros(n, dtype=bool)
     action_applied = np.full(n, "defer", dtype=object)
-    allow_patch = np.ones(n, dtype=bool)
+    allow_patch = np.ones(n, dtype=bool) if allow_patch is None else np.asarray(allow_patch, dtype=bool).copy()
     excluded = np.zeros(n, dtype=bool)
     ever_rolled_back = np.zeros(n, dtype=bool)
     remaining_budget = float(budget_units)
