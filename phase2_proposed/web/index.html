@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VectorSentry · Live Sentry</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/vendor/echarts.min.js"></script>
+</head>
+<body>
+  <div class="glow"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">◆</div>
+      <div>
+        <div class="brand-name">VectorSentry</div>
+        <div class="brand-sub">Live Sentry · mixed-generation embedding defence</div>
+      </div>
+    </div>
+    <div class="status-pill" id="statusPill"><span class="dot"></span><span id="statusText">Connecting…</span></div>
+    <div class="controls">
+      <div class="control">
+        <div class="control-label">Fix budget per round</div>
+        <div class="seg" id="budgetSeg">
+          <button data-v="0.1">Tight<small>10%</small></button>
+          <button data-v="0.3">Lean<small>30%</small></button>
+          <button data-v="0.6">Roomy<small>60%</small></button>
+          <button data-v="1.0">Unlimited<small>100%</small></button>
+        </div>
+      </div>
+      <div class="control">
+        <div class="control-label">Safety check</div>
+        <div class="seg" id="safetySeg">
+          <button data-v="balanced">Balanced</button>
+          <button data-v="strict">Strict</button>
+        </div>
+      </div>
+      <button class="btn-primary" id="simulateBtn"><span class="bolt">⚡</span> Simulate provider update</button>
+      <button class="btn-ghost" id="resetBtn" title="Restore the live index">↺</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- Hero: the whole index -->
+    <section class="card span-8 map-card">
+      <div class="card-head">
+        <div>
+          <div class="kicker">The live index</div>
+          <h2>Every document, live</h2>
+          <p class="sub">5,000 documents laid out by meaning. Bigger dots get more search traffic. Watch the big ones get fixed first.</p>
+        </div>
+        <div class="legend" id="mapLegend"></div>
+      </div>
+      <div id="mapChart" class="chart map"></div>
+      <div class="banner" id="banner"></div>
+    </section>
+
+    <!-- Health + KPIs + pipeline -->
+    <section class="span-4 side">
+      <div class="card health-card">
+        <div class="kicker">Search health</div>
+        <div id="gaugeChart" class="chart gauge"></div>
+        <p class="sub center" id="healthNote">Share of the results popular searches returned before the incident that they still get back.</p>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><div class="kpi-v" id="kpiFlagged">–</div><div class="kpi-l">suspicious documents</div><div class="kpi-d" id="kpiFlaggedD"></div></div>
+        <div class="kpi"><div class="kpi-v" id="kpiRepaired">–</div><div class="kpi-l">repaired &amp; verified</div><div class="kpi-d" id="kpiRepairedD"></div></div>
+        <div class="kpi"><div class="kpi-v" id="kpiBudget">–</div><div class="kpi-l">budget spent</div><div class="kpi-d">re-embed = 1 · patch = 0.1</div></div>
+      </div>
+      <div class="card pipeline" id="pipeline"></div>
+    </section>
+
+    <!-- Timeline + feed -->
+    <section class="card span-8">
+      <div class="card-head">
+        <div>
+          <div class="kicker">Live</div>
+          <h2>The incident, second by second</h2>
+          <p class="sub">Search health dips when the update lands and climbs back as verified fixes ship.</p>
+        </div>
+      </div>
+      <div id="timelineChart" class="chart timeline"></div>
+    </section>
+    <section class="card span-4 feed-card">
+      <div class="kicker">Activity</div>
+      <h2>What just happened</h2>
+      <ol class="feed" id="feed"></ol>
+    </section>
+
+    <!-- The decision -->
+    <section class="card span-12 decision">
+      <div class="card-head">
+        <div>
+          <div class="kicker">The decision</div>
+          <h2>How VectorSentry chose what to fix</h2>
+          <p class="sub">The busiest 1% of documents carry about a third of all searches, so the budget goes where the traffic is.</p>
+        </div>
+        <div class="seg rounds" id="roundTabs"></div>
+      </div>
+      <div class="empty" id="decisionEmpty">Press <b>⚡ Simulate provider update</b>. The plan for every repair round appears here.</div>
+      <div id="decisionBody" class="hidden">
+        <div class="headline">
+          <div class="hl-main"><span class="hl-v" id="hlOurs">–</span><span class="hl-l">of affected search traffic protected, spending <b id="hlBudget">–</b> of what re-embedding everything would cost</span></div>
+          <div class="hl-vs"><span class="hl-v2" id="hlFifo">–</span><span class="hl-l">with the same budget spent first-come-first-served, today's practice</span></div>
+        </div>
+        <div class="two">
+          <div>
+            <div class="chart-title">Every suspicious document, and what it gets</div>
+            <div class="legend" id="decisionLegend"></div>
+            <div id="priorityChart" class="chart half"></div>
+          </div>
+          <div>
+            <div class="chart-title">Prioritized vs. first-come-first-served</div>
+            <div id="curveChart" class="chart half"></div>
+          </div>
+        </div>
+        <div class="chart-title">Where the budget went, and where the traffic is</div>
+        <div id="splitChart" class="chart split"></div>
+      </div>
+    </section>
+
+    <!-- Safety -->
+    <section class="card span-12">
+      <div class="card-head">
+        <div>
+          <div class="kicker">Safety</div>
+          <h2>Every batch is tested before it goes live</h2>
+          <p class="sub" id="safetySub">Each batch is built in a shadow copy and popular logged searches are replayed against it. A batch that would make search worse is rolled back, and its budget is re-planned as exact re-embeds.</p>
+        </div>
+      </div>
+      <div id="wavesChart" class="chart waves"></div>
+    </section>
+
+    <section class="card span-12 report hidden" id="report"></section>
+  </main>
+
+  <footer class="foot">
+    Simulation on BEIR SciFact (5,000 documents): MiniLM-L6 index contaminated with MiniLM-L12 vectors.
+    Detection by generation fingerprint · prioritization by multiple-choice knapsack · verification by query-log replay.
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

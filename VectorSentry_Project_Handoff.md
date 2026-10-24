@@ -101,7 +101,7 @@ The active outer checkout is substantially ahead of the nested GitHub checkout d
 | Phase I remediation | Complete | `phase1_baseline/src/phase1/remediation.py`, remediation results and tests | No core implementation work |
 | Phase II scheduler | Complete, including efficient-frontier greedy and stress evaluation | `phase2_proposed/src/phase2/scheduler.py`, scheduler results and tests | Document final findings in the report |
 | Migration and verification | Complete local prototype | `phase2_proposed/src/phase2/migrate.py`, migration results and tests | External vector-DB adapter remains optional |
-| Live Sentry | Complete and run as a demo | `phase2_proposed/src/phase2/live_sentry.py`, `live_sentry_dashboard.py`, tests | Third baseline comparison panel is optional and deferred |
+| Live Sentry | Complete: web demo (`phase2_proposed/web_app.py`, port 8600) with Streamlit fallback; post-incident patch clean-up | `phase2_proposed/src/phase2/live_sentry.py`, `web_app.py`, `web/`, `live_sentry_dashboard.py`, tests | Automated tests for the web server |
 | Phase comparison | Complete | `phase2_proposed/scripts/run_comparison.py`, comparison results | No core implementation work |
 | Review packaging | Complete for current review materials | `scratch_review1/`, recent commits, `DEVLOG.md` | Keep materials synchronized if code changes |
 | Final evaluation/report | Not yet assembled as the final academic submission | Existing results are available; no final report in this checkout | Write findings, limitations, and reproducibility instructions |

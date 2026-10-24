@@ -1123,3 +1123,69 @@ are clean; drops nDCG@10 by up to 0.126) was added to `run_migration.py`.
   multi-seed runs need a separate mask seed (not yet added).
 - The replay estimates are proxies (impression retention), not nDCG; they
   are close enough for the scheduler's decisions, not a measurement to quote.
+
+---
+
+## 2026-10-24 -- Live Sentry dashboards, post-incident clean-up, stuck-patch fix
+
+**Why:** the owner judged the Streamlit dashboard "mediocre, like a prototype"
+and asked for something that makes a demo audience say "wow", and found the
+fix plan hard to read (a table, with a default budget that re-embedded every
+document so there was nothing to prioritize).
+
+**Built:**
+- `phase2_proposed/web_app.py` + `phase2_proposed/web/`: a small Starlette
+  server around the unchanged Live Sentry engine and a hand-built ECharts
+  front end (dark theme; ECharts stored locally so the demo runs offline).
+  The centrepiece is a live map of all 5,000 documents (t-SNE of the clean
+  embeddings, cached; dot size = search traffic) whose dots change state as
+  documents are hit, flagged, re-embedded or patched -- prioritization made
+  visible. Also: search-health gauge, pipeline stepper, incident timeline
+  (two small multiples, never two y-axes), per-round priority map,
+  prioritized-vs-first-come-first-served protection curve, budget/traffic
+  split, batch-by-batch safety chart, incident report.
+- The Streamlit dashboard was redesigned too and kept as a fallback.
+- Chart colours: categorical slots 1-2 of a validated palette (blue / orange,
+  colourblind separation dE 24.7 light / 26.8 dark); grey for "later" and for
+  the baseline; status colours only for pass/fail, always with an icon.
+- Every chart was screenshotted (headless Chrome) and fixed until labels no
+  longer collided or clipped; a smoothed line that invented bumps was replaced
+  with straight segments.
+
+**Engine changes (phase2/live_sentry.py):**
+- Records search health (replay-canary score of the live index) every tick,
+  the flagged mask, every repair round's plan and batches, and budget spent.
+- **Post-incident clean-up:** a quick patch is an interim fix (~65% of the
+  damage undone). Once the detector is back to normal, patched documents are
+  upgraded to exact re-embeds, busiest first, one round's budget per tick,
+  through the same verified rollout. Before this, a "resolved" incident still
+  showed ~95-97% search health; now it returns to 100%.
+- **Display fix:** "search traffic share" summed to ~4.5, not 1 (each query
+  credits all 10 results), so shares were overstated ~4.5x; now normalized and
+  shown as "x average document".
+- **Default demo budget 30%** (was 100%, where re-embedding everything is
+  simply optimal and the scheduler has nothing to decide).
+
+**Bug found by the owner's own Tight-budget (10%) run:** the incident paused
+"for human review" at 98.7% search health with 51 documents stuck on patches.
+Two causes:
+1. A patched document the detector still flagged counted as "already
+   remediated", so it was never offered a full re-embed. Fix: such documents
+   stay candidates, with the patch option withheld (`remediate(...,
+   allow_patch=...)`).
+2. The clean-up dropped a document for good after one rejected exact
+   re-embed. Rejections there are usually transient (other still-patched
+   documents briefly shift the logged results). Fix: retry on later ticks, up
+   to 3 attempts, fewest-attempts first; a paused incident becomes resolved
+   once the detector is nominal again.
+Re-run of the same scenario on two seeds: resolved on its own in 14 ticks,
+search health 100.0% / 99.9%, no patches left, 1-2 documents still differing
+from the reference (missed by the detector).
+
+**Also:** README rewritten (results, method, demo, reproduction, limitations)
+with dashboard screenshots in `docs/images/`; MIT `LICENSE` added to match the
+licence stated in the handoff; starlette/uvicorn declared in `pyproject.toml`.
+
+**Known gaps:** the web server has no automated tests (verified by live runs
+and screenshots); all browser tabs share one demo state, which suits a
+presentation but is not a multi-user app.
