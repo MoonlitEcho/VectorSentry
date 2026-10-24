@@ -33,44 +33,66 @@ from common.benchmark import build_benchmark, build_contaminated_ratio, mixed_em
 from common.config import Config, load_config  # noqa: E402
 from common.seed import set_seed  # noqa: E402
 from phase1.detection import detect_knn_ood  # noqa: E402
+from phase2.pipeline import build_phase2_context  # noqa: E402
 from phase2.scheduler import (  # noqa: E402
-    build_efficient_frontier_segments,
-    build_mckp_items,
+    build_frontier_segments_from_benefits,
+    build_mckp_items_from_benefits,
     compute_severity,
+    expected_benefits,
     solve_exact,
     solve_greedy,
     solve_greedy_naive,
 )
 
 
+def _scheduling_instance(cfg: Config, benchmark, ctx, ratio: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(candidate document indices, benefit_full, benefit_patch) for one
+    ratio, under whichever benefit model the config selects:
+
+    - recovery_source "replay" (primary): fingerprint-flagged documents,
+      expected benefits from P(contaminated), impression traffic and the
+      replay-estimated patch recovery/harm (phase2.pipeline).
+    - recovery_source "config" (the balanced-actions stress test and the
+      original 2A model): KNN-OOD-flagged documents, min-max severity x
+      traffic x the configured recovery constants.
+    """
+    contaminated = build_contaminated_ratio(cfg, benchmark, ratio)
+    mixed = mixed_embeddings(benchmark, contaminated)
+    if cfg.scheduler.recovery_source == "replay":
+        p_contaminated, flagged = ctx.detector.flag(mixed, cfg.fingerprint.threshold)
+        indices = np.flatnonzero(flagged)
+        benefit_full, benefit_patch = expected_benefits(
+            p_contaminated[indices], ctx.traffic[indices], cfg.scheduler.recovery_full_reembed,
+            ctx.recovery_patch, ctx.harm_patch,
+        )
+    else:
+        detection_result = detect_knn_ood(mixed, ratio=ratio, k=cfg.detection.knn_k)
+        indices = np.flatnonzero(detection_result.predicted)
+        base = compute_severity(detection_result.scores[indices]) * benchmark.doc_traffic[indices]
+        benefit_full = base * cfg.scheduler.recovery_full_reembed
+        benefit_patch = base * cfg.scheduler.recovery_patch
+    return indices, benefit_full, benefit_patch
+
+
 def run_full_scale_sweep(cfg: Config) -> pd.DataFrame:
     """Runs the PRODUCTION scheduler (efficient-frontier greedy) at FULL
-    SCALE (every flagged document) for every ratio x budget level -- this
-    is what a real deployment would execute (2B), and what 2C compares
-    against Phase 1's baselines."""
+    SCALE (every flagged document) for every ratio x budget level -- the
+    plan a real deployment would execute (2B) and 2C compares against
+    Phase 1's baselines."""
     benchmark = build_benchmark(cfg)
+    ctx = build_phase2_context(cfg, benchmark)
     rows: list[dict] = []
 
     for ratio in cfg.contamination.ratios:
-        contaminated = build_contaminated_ratio(cfg, benchmark, ratio)
-        mixed = mixed_embeddings(benchmark, contaminated)
-        detection_result = detect_knn_ood(mixed, ratio=ratio, k=cfg.detection.knn_k)
-        flagged_indices = np.flatnonzero(detection_result.predicted)
-        n_flagged = len(flagged_indices)
-
-        severity = compute_severity(detection_result.scores[flagged_indices])
-        traffic = benchmark.doc_traffic[flagged_indices]
-        segments = build_efficient_frontier_segments(
-            severity,
-            traffic,
-            cfg.remediation.cost_full_reembed,
-            cfg.remediation.cost_patch,
-            cfg.scheduler.recovery_full_reembed,
-            cfg.scheduler.recovery_patch,
+        indices, benefit_full, benefit_patch = _scheduling_instance(cfg, benchmark, ctx, ratio)
+        n_flagged = len(indices)
+        segments = build_frontier_segments_from_benefits(
+            benefit_full, benefit_patch, cfg.remediation.cost_full_reembed, cfg.remediation.cost_patch
         )
 
         for budget_level in cfg.budget.levels:
-            budget_units = budget_level * n_flagged * cfg.remediation.cost_full_reembed
+            # Same absolute budget sizing as Phase 1 and run_migration.py.
+            budget_units = budget_level * round(ratio * len(benchmark.documents)) * cfg.remediation.cost_full_reembed
             plan = solve_greedy(segments, n_items=n_flagged, budget=budget_units)
             n_full = int(np.sum(plan.actions == "full_reembed"))
             n_patch = int(np.sum(plan.actions == "patch"))
@@ -90,7 +112,7 @@ def run_full_scale_sweep(cfg: Config) -> pd.DataFrame:
             print(
                 f"ratio={ratio:.2f} budget={budget_level:.2f}: "
                 f"full_reembed={n_full:4d} patch={n_patch:4d} defer={n_defer:4d} "
-                f"benefit={plan.total_benefit:.3f}"
+                f"benefit={plan.total_benefit:.4f}"
             )
 
     return pd.DataFrame(rows)
@@ -105,35 +127,19 @@ def run_optimality_gap_sweep(cfg: Config) -> pd.DataFrame:
     that motivated switching the production scheduler from the naive to
     the frontier greedy (see DEVLOG.md's sub-phase 2A entry)."""
     benchmark = build_benchmark(cfg)
+    ctx = build_phase2_context(cfg, benchmark)
     rows: list[dict] = []
 
     for ratio in cfg.contamination.ratios:
-        contaminated = build_contaminated_ratio(cfg, benchmark, ratio)
-        mixed = mixed_embeddings(benchmark, contaminated)
-        detection_result = detect_knn_ood(mixed, ratio=ratio, k=cfg.detection.knn_k)
-        flagged_indices = np.flatnonzero(detection_result.predicted)
+        indices, benefit_full, benefit_patch = _scheduling_instance(cfg, benchmark, ctx, ratio)
 
         rng = np.random.default_rng(cfg.seed)
-        sample_size = min(cfg.scheduler.exact_solver_sample_size, len(flagged_indices))
-        sample = rng.choice(flagged_indices, size=sample_size, replace=False)
-
-        severity = compute_severity(detection_result.scores[sample])
-        traffic = benchmark.doc_traffic[sample]
-        items = build_mckp_items(
-            severity,
-            traffic,
-            cfg.remediation.cost_full_reembed,
-            cfg.remediation.cost_patch,
-            cfg.scheduler.recovery_full_reembed,
-            cfg.scheduler.recovery_patch,
-        )
-        segments = build_efficient_frontier_segments(
-            severity,
-            traffic,
-            cfg.remediation.cost_full_reembed,
-            cfg.remediation.cost_patch,
-            cfg.scheduler.recovery_full_reembed,
-            cfg.scheduler.recovery_patch,
+        sample_size = min(cfg.scheduler.exact_solver_sample_size, len(indices))
+        sample = rng.choice(len(indices), size=sample_size, replace=False)
+        bf, bp = benefit_full[sample], benefit_patch[sample]
+        items = build_mckp_items_from_benefits(bf, bp, cfg.remediation.cost_full_reembed, cfg.remediation.cost_patch)
+        segments = build_frontier_segments_from_benefits(
+            bf, bp, cfg.remediation.cost_full_reembed, cfg.remediation.cost_patch
         )
 
         for budget_level in cfg.budget.levels:

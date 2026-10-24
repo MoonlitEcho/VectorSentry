@@ -29,7 +29,9 @@ contamination:
 
 traffic:
   distribution: zipf
-  zipf_s: 1.2
+  zipf_s: 1.0 # classic Zipf exponent; 1.2 left an effective sample of ~6.5 eval queries
+  doc_signal: impressions # document traffic = position-discounted impressions in the query log
+  impression_depth: 10
 
 index:
   backend: faiss
@@ -46,6 +48,8 @@ remediation:
   cost_full_reembed: 1.0
   cost_patch: 0.1
   calibration_sample_size: 300
+  adapter: ridge # affine B->A map fitted on the probe batch; shared by both phases
+  ridge_alpha: 1.0
   detector: knn_ood
 
 paths:

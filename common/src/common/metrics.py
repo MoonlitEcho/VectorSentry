@@ -104,3 +104,22 @@ def evaluate_retrieval(
         result[f"recall@{k}_traffic_weighted"] = result[f"recall@{k}"]
 
     return result
+
+
+def per_query_ndcg(
+    embeddings: np.ndarray,
+    doc_ids: list[str],
+    queries: list[_QueryLike],
+    query_embeddings: np.ndarray,
+    qrels_eval: dict[str, set[str]],
+    k: int = 10,
+) -> np.ndarray:
+    """nDCG@k for each query separately (aligned to `queries`) -- what a
+    paired statistical comparison of two index states needs, where
+    `evaluate_retrieval` only reports the average."""
+    index = build_index(embeddings)
+    doc_ids_arr = np.asarray(doc_ids)
+    _, indices = search(index, query_embeddings, k)
+    return np.array(
+        [ndcg_at_k(doc_ids_arr[indices[row]].tolist(), qrels_eval[q.query_id], k) for row, q in enumerate(queries)]
+    )

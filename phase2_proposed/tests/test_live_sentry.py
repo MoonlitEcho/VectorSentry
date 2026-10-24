@@ -13,12 +13,14 @@ from phase2.live_sentry import (
     LiveSentryContext,
     LiveSentryState,
     STATUS_ALERT,
+    STATUS_NEEDS_REVIEW,
     STATUS_REMEDIATING,
     STATUS_RESOLVED,
     STATUS_STABLE,
-    compute_alert_threshold,
     run_one_tick,
 )
+from phase2.migrate import labelled_canary_scorer
+from phase2.pipeline import build_phase2_context
 
 
 def _synthetic_context(n=40, dim=8, seed=0, initial_budget_level=1.0, regression_tolerance=1.0) -> LiveSentryContext:
@@ -56,7 +58,7 @@ def _synthetic_context(n=40, dim=8, seed=0, initial_budget_level=1.0, regression
     cfg = Config(seed=seed)
     cfg.detection.knn_k = 5
     cfg.remediation.calibration_sample_size = 20
-    cfg.live_sentry.alert_threshold_percentile = 99.0
+    cfg.fingerprint.k = 5
     cfg.live_sentry.initial_budget_level = initial_budget_level
     cfg.migration.golden_query_count = 1
     cfg.migration.regression_tolerance = regression_tolerance
@@ -71,9 +73,12 @@ def _synthetic_context(n=40, dim=8, seed=0, initial_budget_level=1.0, regression
         doc_ids=doc_ids,
         eval_queries=[query],
         query_embeddings=query_embedding,
-        golden_queries=[query],
-        golden_query_embeddings=query_embedding,
-        patched_emb_b=emb_b.copy(),  # unused (recovery_patch defaults make full_reembed dominant)
+        canary=labelled_canary_scorer(doc_ids, [query], query_embedding, qrels_eval),
+        canary_description="labelled canary: 1 query",
+        canary_size=1,
+        # No query log in this synthetic benchmark, so the replay calibration
+        # is skipped and the configured recovery constant is used instead.
+        phase2=build_phase2_context(cfg, benchmark),
     )
 
 
@@ -111,16 +116,15 @@ def test_inject_contamination_only_affects_currently_clean_documents():
     assert int(contaminated_after_second.sum()) >= n_contaminated_first
 
 
-def test_compute_alert_threshold_flags_almost_none_of_the_clean_baseline():
+def test_fingerprint_detector_flags_almost_none_of_the_clean_control():
     ctx = _synthetic_context()
-    threshold = compute_alert_threshold(ctx.benchmark.emb_a, k=5, percentile=99.0)
-    # By construction (99th percentile of the clean distribution), at most
-    # ~1% of clean documents should exceed their OWN calibration threshold.
-    from phase1.detection import knn_ood_scores
-
-    scores = knn_ood_scores(ctx.benchmark.emb_a, k=5)
-    frac_over = float(np.mean(scores > threshold))
-    assert frac_over <= 0.05
+    _, flagged_clean = ctx.phase2.detector.flag(ctx.benchmark.emb_a, ctx.cfg.fingerprint.threshold)
+    _, flagged_b = ctx.phase2.detector.flag(ctx.benchmark.emb_b, ctx.cfg.fingerprint.threshold)
+    assert float(np.mean(flagged_clean)) <= 0.05
+    # This fixture's generation B is random directions in only 8 dimensions,
+    # so a few land near generation A's cluster by chance; the real 384-d
+    # benchmark separates far more cleanly (see run_detection.py).
+    assert float(np.mean(flagged_b)) >= 0.8
 
 
 def test_run_one_tick_does_nothing_when_no_incident_active():
@@ -235,10 +239,29 @@ def test_repeated_verification_failure_defers_instead_of_looping_forever():
     assert state.db_b_deferred.any()
     assert state.consecutive_verification_failures == 0
 
-    # And the incident should resolve shortly after (deferred candidates
-    # excluded from further scheduling -- nothing left to retry).
+    # Deferred candidates are excluded from further scheduling, but residual
+    # anomalies must remain visibly blocked for manual review, not be called
+    # resolved.
     for _ in range(3):
-        if state.snapshot()["status"] == STATUS_RESOLVED:
+        if state.snapshot()["status"] == STATUS_NEEDS_REVIEW:
             break
         run_one_tick(state, ctx)
-    assert state.snapshot()["status"] == STATUS_RESOLVED
+    snap = state.snapshot()
+    assert snap["status"] == STATUS_NEEDS_REVIEW
+    assert snap["last_db_b_flagged"] > snap["last_db_a_flagged"]
+    assert snap["incident_active"] is False
+
+
+def test_every_tick_records_history_and_reset_clears_it():
+    ctx = _synthetic_context()
+    state = LiveSentryState(ctx.benchmark)
+    run_one_tick(state, ctx)
+    state.inject_contamination(ctx, batch_fraction=0.2, seed=1)
+    run_one_tick(state, ctx)
+
+    history = state.snapshot()["history"]
+    assert [point["tick"] for point in history] == [1, 2]
+    assert history[-1]["db_b_flagged"] > history[-1]["db_a_flagged"]
+
+    state.reset(ctx.benchmark)
+    assert state.snapshot()["history"] == []

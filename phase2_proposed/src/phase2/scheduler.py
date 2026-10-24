@@ -305,3 +305,114 @@ def solve_exact(items: list[MCKPItem], n_items: int, budget: float) -> ScheduleP
             total_cost += item.cost
 
     return SchedulePlan(actions, total_benefit, total_cost)
+
+
+# --- Redesigned benefit model (see DEVLOG.md's "Redesign" entry) -----------
+#
+# The functions above take a min-max-normalized detector distance as
+# "severity" and one global recovery constant per action. The redesigned
+# pipeline replaces both with quantities that have a real meaning:
+#
+#   Benefit(i, full_reembed) = p_i * traffic_i * recovery_full
+#   Benefit(i, patch)        = (p_i * recovery_patch - (1 - p_i) * harm_patch) * traffic_i
+#
+# - p_i is the fingerprint detector's P(document i is contaminated), so each
+#   benefit is an EXPECTED value: fixing a document only helps if it was
+#   actually broken.
+# - Re-embedding a clean document is a harmless no-op (it reproduces the
+#   vector already there), so its downside is only the wasted cost.
+#   Patching a clean document is NOT harmless: the adapter pushes a correct
+#   vector through a B->A map, damaging it by harm_patch (estimated by
+#   phase2.calibration). Patch is therefore only worth choosing when the
+#   detector is confident.
+# - Because p_i now enters the two actions differently, whether patch sits
+#   on a document's efficient frontier depends on THAT document -- the
+#   "one action uniformly dominates for everyone" degeneracy DEVLOG.md 2A
+#   documents no longer holds by construction.
+
+
+def expected_benefits(
+    p_contaminated: np.ndarray,
+    traffic: np.ndarray,
+    recovery_full_reembed: float,
+    recovery_patch: float,
+    harm_patch: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-document expected benefit of (full_reembed, patch). See the block
+    comment above for the formula and why each term is there."""
+    p = np.asarray(p_contaminated, dtype=np.float64)
+    t = np.asarray(traffic, dtype=np.float64)
+    benefit_full = p * t * recovery_full_reembed
+    benefit_patch = (p * recovery_patch - (1.0 - p) * harm_patch) * t
+    return benefit_full, benefit_patch
+
+
+def build_frontier_segments_from_benefits(
+    benefit_full: np.ndarray,
+    benefit_patch: np.ndarray,
+    cost_full_reembed: float,
+    cost_patch: float,
+) -> list[MCKPSegment]:
+    """General per-document efficient frontier for arbitrary (possibly
+    negative) per-document benefits: the upper concave hull of
+    {defer (0, 0), patch, full_reembed} on a cost-vs-benefit plot.
+
+    A choice is dropped if it does not raise benefit over the cheaper choice
+    before it (e.g. a patch with negative expected benefit), or if it sits
+    under the straight line between its neighbours on the hull (it would
+    never be the optimal stopping point in the LP relaxation). The surviving
+    points become consecutive upgrade segments, exactly as in
+    `build_efficient_frontier_segments`, and `solve_greedy` consumes them
+    unchanged.
+    """
+    segments: list[MCKPSegment] = []
+    for i in range(len(benefit_full)):
+        points = sorted(
+            [(cost_patch, float(benefit_patch[i]), "patch"), (cost_full_reembed, float(benefit_full[i]), "full_reembed")],
+            key=lambda pt: pt[0],
+        )
+        hull = [(0.0, 0.0, "defer")]
+        for point in points:
+            if point[1] <= hull[-1][1] + 1e-15:
+                continue  # costs more but gains nothing over the cheaper option
+            while len(hull) >= 2:
+                (x1, y1, _), (x2, y2, _) = hull[-2], hull[-1]
+                # Pop the middle point if it lies on/under the chord to `point`.
+                if (y2 - y1) * (point[0] - x1) <= (point[1] - y1) * (x2 - x1):
+                    hull.pop()
+                else:
+                    break
+            hull.append(point)
+        for (x1, y1, a1), (x2, y2, a2) in zip(hull, hull[1:]):
+            segments.append(MCKPSegment(i, a1, a2, x2 - x1, y2 - y1))
+    return segments
+
+
+def build_mckp_items_from_benefits(
+    benefit_full: np.ndarray,
+    benefit_patch: np.ndarray,
+    cost_full_reembed: float,
+    cost_patch: float,
+) -> list[MCKPItem]:
+    """Exact-solver counterpart of `build_frontier_segments_from_benefits`.
+    Candidates with non-positive benefit are omitted: the ILP would never
+    pick them over Defer anyway."""
+    items: list[MCKPItem] = []
+    for i in range(len(benefit_full)):
+        if benefit_full[i] > 0:
+            items.append(MCKPItem(i, "full_reembed", float(benefit_full[i]), cost_full_reembed))
+        if benefit_patch[i] > 0:
+            items.append(MCKPItem(i, "patch", float(benefit_patch[i]), cost_patch))
+    return items
+
+
+def priority_order(segments: list[MCKPSegment], plan: SchedulePlan) -> np.ndarray:
+    """The order in which a plan's acted-on documents should be ROLLED OUT:
+    by the incremental ratio of the first segment `solve_greedy` applied to
+    each, i.e. the order the scheduler itself valued them. Used by the
+    staged migration so the most valuable fixes ship in the first wave."""
+    first_ratio: dict[int, float] = {}
+    for segment in sorted(segments, key=lambda s: (-s.ratio, -s.incremental_benefit)):
+        if plan.actions[segment.local_index] != "defer":
+            first_ratio.setdefault(segment.local_index, segment.ratio)
+    return np.array(sorted(first_ratio, key=lambda i: -first_ratio[i]), dtype=int)

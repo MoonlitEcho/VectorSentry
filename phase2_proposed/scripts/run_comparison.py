@@ -39,14 +39,17 @@ STRATEGY_LABELS = {
     "oracle_full_recovery": "Oracle full recovery",
     "fifo_full_reembed": "Phase 1: FIFO full re-embed",
     "uniform_patch": "Phase 1: Uniform patch",
-    "phase2_mckp": "Phase 2: MCKP scheduler (verified)",
+    "phase2_verified": "Phase 2: fingerprint + MCKP + staged rollout",
+    "phase2_unverified": "Phase 2 plan without the gate",
+    "ablation_fingerprint_fifo": "Ablation: fingerprint + FIFO",
+    "ablation_knn_mckp": "Ablation: KNN-OOD + MCKP",
 }
+PHASE2 = "phase2_verified"
 
 
 def load_combined() -> pd.DataFrame:
     phase1_df = pd.read_csv(PHASE1_CSV)
-    phase2_df = pd.read_csv(PHASE2_CSV).copy()
-    phase2_df["strategy"] = "phase2_mckp"
+    phase2_df = pd.read_csv(PHASE2_CSV)  # long format: one row per (ratio, strategy, budget_level)
 
     keep_cols = ["ratio", "strategy", "budget_level", "ndcg@10", "recall@10", "ndcg@10_traffic_weighted", "recall@10_traffic_weighted"]
     combined = pd.concat([phase1_df[keep_cols], phase2_df[keep_cols]], ignore_index=True)
@@ -59,8 +62,15 @@ def plot_comparison(df: pd.DataFrame, out_path: Path, metric: str) -> None:
     if len(ratios) == 1:
         axes = [axes]
 
-    real_strategies = ["fifo_full_reembed", "uniform_patch", "phase2_mckp"]
-    colors = {"fifo_full_reembed": "tab:blue", "uniform_patch": "tab:orange", "phase2_mckp": "tab:green"}
+    real_strategies = ["fifo_full_reembed", "uniform_patch", "ablation_knn_mckp", "ablation_fingerprint_fifo", PHASE2]
+    colors = {
+        "fifo_full_reembed": "tab:blue",
+        "uniform_patch": "tab:orange",
+        "ablation_knn_mckp": "tab:brown",
+        "ablation_fingerprint_fifo": "tab:purple",
+        PHASE2: "tab:green",
+    }
+    linestyles = {"ablation_knn_mckp": "--", "ablation_fingerprint_fifo": "--"}
 
     for ax, ratio in zip(axes, ratios):
         sub = df[df["ratio"] == ratio]
@@ -73,19 +83,21 @@ def plot_comparison(df: pd.DataFrame, out_path: Path, metric: str) -> None:
                 continue
             ax.plot(
                 curve["budget_level"], curve[metric], marker="o", label=STRATEGY_LABELS[strategy],
-                color=colors[strategy],
+                color=colors[strategy], linestyle=linestyles.get(strategy, "-"),
+                linewidth=2.5 if strategy == PHASE2 else 1.5,
             )
 
         ax.axhline(no_rem, color="gray", linestyle=":", label="No remediation" if ratio == ratios[0] else None)
         ax.axhline(oracle, color="black", linestyle="--", label="Oracle full recovery" if ratio == ratios[0] else None)
         ax.set_title(f"ratio={ratio:.2f}")
         ax.set_xlabel("Budget level")
-        ax.set_ylim(0, 1.0)
+        lo = min(sub[metric].min(), no_rem)
+        ax.set_ylim(lo - 0.03, oracle + 0.03)
 
     axes[0].set_ylabel(metric)
     fig.suptitle(f"Phase 1 vs. Phase 2: {metric} vs. budget (head-to-head)")
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.08))
+    fig.legend(handles, labels, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.12))
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -104,10 +116,10 @@ def quantify_improvement(df: pd.DataFrame, metric: str = "ndcg@10") -> pd.DataFr
         oracle = sub[sub["strategy"] == "oracle_full_recovery"][metric].iloc[0]
         headroom = oracle - no_rem
 
-        for budget_level in sorted(sub[sub["strategy"] == "phase2_mckp"]["budget_level"].unique()):
+        for budget_level in sorted(sub[sub["strategy"] == PHASE2]["budget_level"].unique()):
             fifo_row = sub[(sub["strategy"] == "fifo_full_reembed") & (sub["budget_level"] == budget_level)]
             patch_row = sub[(sub["strategy"] == "uniform_patch") & (sub["budget_level"] == budget_level)]
-            p2_row = sub[(sub["strategy"] == "phase2_mckp") & (sub["budget_level"] == budget_level)]
+            p2_row = sub[(sub["strategy"] == PHASE2) & (sub["budget_level"] == budget_level)]
             if len(fifo_row) == 0 or len(patch_row) == 0 or len(p2_row) == 0:
                 continue
 
@@ -146,16 +158,21 @@ def main() -> None:
         plot_comparison(df, RESULTS_DIR / f"comparison_quality_by_budget_{suffix}.png", metric)
 
     improvement_df = quantify_improvement(df)
+    tw = quantify_improvement(df, "ndcg@10_traffic_weighted")
+    improvement_df["best_phase1_traffic_weighted"] = tw["best_phase1"].values
+    improvement_df["phase2_traffic_weighted"] = tw["phase2"].values
+    improvement_df["pct_of_headroom_traffic_weighted"] = tw["pct_of_headroom"].values
     improvement_df.to_csv(RESULTS_DIR / "comparison_improvement.csv", index=False)
 
     print("=== Phase 2 vs. best-of-Phase-1, at matched budget (unweighted nDCG@10) ===")
     print(improvement_df.to_string(index=False))
     print()
     print(f"Mean improvement across all ratio x budget combinations: {improvement_df['abs_improvement'].mean():+.4f} nDCG@10")
-    print(f"  ({improvement_df['pct_of_headroom'].mean():+.1f}% of available oracle-vs-no-remediation headroom)")
+    print(f"  ({improvement_df['pct_of_headroom'].mean():+.1f}% of available oracle-vs-no-remediation headroom; "
+          f"traffic-weighted: {improvement_df['pct_of_headroom_traffic_weighted'].mean():+.1f}%)")
     print(f"Combinations where Phase 2 beat both Phase 1 baselines: "
           f"{(improvement_df['abs_improvement'] > 0).sum()} / {len(improvement_df)}")
-    print(f"Combinations where Phase 2 underperformed both (incl. verification aborts): "
+    print(f"Combinations where Phase 2 underperformed the better Phase 1 baseline: "
           f"{(improvement_df['abs_improvement'] < 0).sum()} / {len(improvement_df)}")
 
     print("\n=== Budget needed to reach a fixed quality target, per ratio ===")
@@ -164,7 +181,7 @@ def main() -> None:
         no_rem = df[(df["ratio"] == ratio) & (df["strategy"] == "no_remediation")]["ndcg@10"].iloc[0]
         target = no_rem + 0.5 * (oracle - no_rem)  # halfway to the oracle ceiling
         b_fifo = budget_to_reach_target(df, "fifo_full_reembed", ratio, target)
-        b_p2 = budget_to_reach_target(df, "phase2_mckp", ratio, target)
+        b_p2 = budget_to_reach_target(df, PHASE2, ratio, target)
         print(f"ratio={ratio:.2f} target(50% of headroom)={target:.3f}: "
               f"FIFO needs budget={b_fifo}, Phase 2 needs budget={b_p2}")
 
