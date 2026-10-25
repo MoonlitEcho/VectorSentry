@@ -44,3 +44,6 @@ Thumbs.db
 *.npz
 !phase1_baseline/results/**/*.npy
 !phase2_proposed/results/**/*.npy
+
+# --- vectorsentry CLI: local Qdrant data, run history, query log ---
+.vectorsentry/

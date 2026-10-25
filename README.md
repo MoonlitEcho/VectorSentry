@@ -26,6 +26,7 @@ through a verified, staged rollout that never makes search worse.
 - [Results at a glance](#results-at-a-glance)
 - [How it works](#how-it-works)
 - [Live demo](#live-demo)
+- [Running on a real vector database](#running-on-a-real-vector-database)
 - [Quick start](#quick-start)
 - [Reproducing the results](#reproducing-the-results)
 - [Repository layout](#repository-layout)
@@ -154,6 +155,67 @@ A Streamlit version of the dashboard is kept as a fallback:
 
 ---
 
+## Running on a real vector database
+
+The `vectorsentry` package (in `production/`) runs the same decision logic
+against a real **Qdrant** collection, with real embedding models re-embedding
+real document text:
+
+- vectors, texts and IDs are read from the database;
+- the probe batch is embedded on the spot by both models;
+- traffic and the safety canary come from a **query log** (JSON Lines: query,
+  count, and the results it returned before the incident);
+- a full re-embed calls the serving model only for fixes the rollout actually
+  tries, and the cost is counted;
+- every run is recorded in SQLite; **dry-run is the default**, and an applied
+  run can be **rolled back exactly**;
+- a **write-path guard** runs the same fingerprint on new vectors before they
+  are written.
+
+```bash
+pip install -e ".[qdrant]"
+python -m vectorsentry demo-setup             # demo collection: 5,000 docs, 503 silently contaminated + query log
+python -m vectorsentry scan                   # detect and report
+python -m vectorsentry run                    # plan only (dry-run)
+python -m vectorsentry run --apply            # repair through the verified rollout
+python -m vectorsentry runs                   # history
+python -m vectorsentry show 3                 # one run's plan, in rollout order
+python -m vectorsentry rollback 3             # restore every vector run 3 changed
+python -m vectorsentry guard-check            # the write-path guard on fresh vectors
+```
+
+It uses Qdrant's embedded local mode under `.vectorsentry/` by default; pass
+`--qdrant-url http://host:6333` to use a Qdrant server. Measured on the demo
+collection with the real MiniLM models:
+
+| Step | Result |
+|---|---|
+| Scan | 507 flagged (503 truly contaminated); search health 91.5% |
+| Dry-run | Plan: re-embed 135, patch 150, protecting 91% of affected traffic; nothing changed |
+| Apply (budget 150) | 145 re-embedded, 50 patched, 107 fixes rolled back by the gate; search health 91.5% -> 96.4% |
+| Rollback | 195 documents restored; scan back to exactly 507 flagged and 91.5% |
+| Guard | Accepted 200/200 serving-model vectors, rejected 199/200 suspect-model vectors |
+
+The library can also be used directly:
+
+```python
+from qdrant_client import QdrantClient
+from vectorsentry import QdrantStore, QueryLog, SentenceTransformerEmbedder, SentryConfig, StateStore, VectorSentry
+
+sentry = VectorSentry(
+    QdrantStore(QdrantClient(url="http://localhost:6333"), "docs"),
+    SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2"),   # the model the index should use
+    SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L12-v2"),  # the suspected contaminating model
+    QueryLog.load("query_log.jsonl"),
+    StateStore("state.db"),
+    SentryConfig(budget=150),
+)
+report = sentry.run(apply=False)      # dry-run plan
+guard = sentry.guard()                # check vectors before writing them
+```
+
+---
+
 ## Quick start
 
 Requires Python 3.11+. Runs on a laptop CPU; no API keys or paid services.
@@ -171,7 +233,7 @@ One editable install makes `common`, `phase1` and `phase2` importable from
 anywhere (see [`pyproject.toml`](pyproject.toml)).
 
 ```bash
-pytest                    # 89 fast unit tests, ~1 minute, no downloads
+pytest                    # 106 fast unit tests, a few minutes, no downloads
 pytest -m integration     # slower tests on real BEIR data and real models
 ```
 
@@ -227,6 +289,15 @@ phase2_proposed/           VectorSentry
   web_app.py, web/         live demo: Starlette API + ECharts front end
   live_sentry_dashboard.py Streamlit fallback dashboard
   scripts/ configs/ results/ tests/
+production/                package `vectorsentry`: the pipeline on a real vector database
+  src/vectorsentry/
+    adapters.py            VectorStore (Qdrant, in-memory) and Embedder (sentence-transformers)
+    querylog.py            query log -> document traffic and the replay canary
+    engine.py              calibrate -> scan -> plan -> dry-run / apply -> rollback
+    state.py               SQLite run history and rollback snapshots
+    guard.py               write-path guard
+    cli.py                 `python -m vectorsentry ...`
+  tests/
 docs/images/               README screenshots
 DEVLOG.md                  dated record of every design decision, finding and fix
 ```
@@ -251,8 +322,9 @@ benchmark.
 - **Assumes pre-incident search logs** for traffic and for the replay canary.
 - **Single seed.** Multi-seed runs need a separate seed for the contamination
   mask (not yet added).
-- **Local prototype.** The index is an in-memory FAISS flat index; no adapter
-  for an external vector database is included.
+- **Prototype scale.** Experiments use an exact in-memory FAISS index over
+  5,000 documents. The `vectorsentry` package runs on Qdrant, but has not been
+  run at production scale (millions of vectors) or with several workers.
 
 ---
 

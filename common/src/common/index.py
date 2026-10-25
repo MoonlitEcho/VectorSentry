@@ -21,7 +21,7 @@ except ImportError as exc:  # pragma: no cover - dependency is required, not opt
     ) from exc
 
 
-def build_index(embeddings: np.ndarray) -> "faiss.Index":
+def build_index(embeddings: np.ndarray) -> faiss.Index:
     """Builds an exact inner-product FAISS index over `embeddings`."""
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
@@ -29,7 +29,7 @@ def build_index(embeddings: np.ndarray) -> "faiss.Index":
     return index
 
 
-def search(index: "faiss.Index", query_embeddings: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+def search(index: faiss.Index, query_embeddings: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
     """Searches `index` for the top-k nearest neighbors of each query.
 
     Returns (scores, indices), each of shape (num_queries, k). `indices`

@@ -12,6 +12,7 @@ general graded-relevance nDCG formula (2^rel - 1) and are used directly.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 
 import numpy as np
@@ -50,7 +51,7 @@ def recall_at_k(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> flo
 def evaluate_retrieval(
     embeddings: np.ndarray,
     doc_ids: list[str],
-    eval_queries: list[_QueryLike],
+    eval_queries: Sequence[_QueryLike],
     query_embeddings: np.ndarray,
     qrels_eval: dict[str, set[str]],
     query_traffic: dict[str, float],
@@ -109,7 +110,7 @@ def evaluate_retrieval(
 def per_query_ndcg(
     embeddings: np.ndarray,
     doc_ids: list[str],
-    queries: list[_QueryLike],
+    queries: Sequence[_QueryLike],
     query_embeddings: np.ndarray,
     qrels_eval: dict[str, set[str]],
     k: int = 10,

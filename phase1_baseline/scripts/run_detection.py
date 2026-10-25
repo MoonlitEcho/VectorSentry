@@ -46,10 +46,12 @@ def run_all_detectors(cfg: Config) -> pd.DataFrame:
         contaminated = build_contaminated_ratio(cfg, benchmark, ratio)
         embeddings = mixed_embeddings(benchmark, contaminated)
 
+        # Bind this iteration's embeddings/ratio explicitly (default args), so
+        # each call can never see a later iteration's values.
         detector_calls = {
-            "knn_ood": lambda: detect_knn_ood(embeddings, ratio=ratio, k=cfg.detection.knn_k),
-            "lof": lambda: detect_lof(embeddings, ratio=ratio, k=cfg.detection.lof_k),
-            "isolation_forest": lambda: detect_isolation_forest(embeddings, ratio=ratio, seed=cfg.seed),
+            "knn_ood": lambda e=embeddings, r=ratio: detect_knn_ood(e, ratio=r, k=cfg.detection.knn_k),
+            "lof": lambda e=embeddings, r=ratio: detect_lof(e, ratio=r, k=cfg.detection.lof_k),
+            "isolation_forest": lambda e=embeddings, r=ratio: detect_isolation_forest(e, ratio=r, seed=cfg.seed),
         }
 
         for name, call in detector_calls.items():

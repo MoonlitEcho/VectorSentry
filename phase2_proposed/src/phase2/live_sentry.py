@@ -35,7 +35,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import threading
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 
@@ -87,6 +87,8 @@ def build_context(cfg: Config) -> LiveSentryContext:
     doc_ids = [d.doc_id for d in benchmark.documents]
     eval_rows = [i for i, q in enumerate(benchmark.queries) if q.query_id in benchmark.qrels_eval]
     eval_queries = [benchmark.queries[i] for i in eval_rows]
+    if benchmark.query_emb_a is None:
+        raise ValueError("Live Sentry needs serving-model query embeddings (benchmark.query_emb_a).")
     query_embeddings = benchmark.query_emb_a[eval_rows]
     canary, description = build_canary(cfg, benchmark)
 
@@ -528,7 +530,7 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
     rollout_rank = {int(local): rank for rank, local in enumerate(remediation.rollout_order, start=1)}
     plan_rows = []
     for local_index, action in enumerate(plan.actions):
-        segment = segment_by_choice.get((local_index, action))
+        chosen = segment_by_choice.get((local_index, action))
         expected = {
             "full_reembed": remediation.benefit_full[local_index],
             "patch": remediation.benefit_patch[local_index],
@@ -546,7 +548,7 @@ def run_one_tick(state: LiveSentryState, ctx: LiveSentryContext) -> None:
                 "cost": float(ctx.cfg.remediation.cost_full_reembed if action == "full_reembed" else ctx.cfg.remediation.cost_patch if action == "patch" else 0.0),
                 "expected_recovery": float(recovery_by_action[action]),
                 "expected_benefit": float(expected),
-                "priority_ratio": float(segment.ratio if segment is not None else 0.0),
+                "priority_ratio": float(chosen.ratio if chosen is not None else 0.0),
             }
         )
     plan_rows.sort(key=lambda row: (row["action"] == "defer", -row["priority_ratio"], -row["expected_benefit"]))

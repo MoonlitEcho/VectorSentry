@@ -15,17 +15,18 @@ stored vectors. Ground-truth contamination labels are never read.
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from common.benchmark import Benchmark
 from common.config import Config
 from common.data import Query, zipf_query_weights
 from common.patch import Adapter, fit_adapter, sample_calibration_indices
 from phase2.calibration import ActionEffects, estimate_action_effects
 from phase2.fingerprint import FingerprintDetector
 from phase2.migrate import (
+    RowSource,
     StagedMigrationReport,
     execute_staged_migration,
     labelled_canary_scorer,
@@ -40,6 +41,8 @@ from phase2.scheduler import (
     solve_greedy,
 )
 
+if TYPE_CHECKING:  # type hints only: importing it loads the embedding stack (torch)
+    from common.benchmark import Benchmark
 
 @dataclasses.dataclass
 class Phase2Context:
@@ -215,7 +218,7 @@ def remediate(
     cfg: Config,
     ctx: Phase2Context,
     stored: np.ndarray,
-    emb_a: np.ndarray,
+    emb_a: RowSource,
     candidate_indices: np.ndarray,
     p_contaminated: np.ndarray,
     budget_units: float,

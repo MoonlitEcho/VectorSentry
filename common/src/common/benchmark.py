@@ -85,7 +85,7 @@ class ContaminatedRatio:
 
     ratio: float
     mask: np.ndarray  # (N,) bool; True = document served by generation B (contaminated)
-    index: "faiss.Index"
+    index: faiss.Index
 
 
 def benchmark_dir(cfg: Config) -> Path:
