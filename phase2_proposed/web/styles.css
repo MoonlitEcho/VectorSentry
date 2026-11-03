@@ -183,8 +183,9 @@ h2 { font-size: 19px; margin: 3px 0 2px; letter-spacing: -0.01em; font-weight: 7
 
 /* ---- Feed ---- */
 .feed-card { display: flex; flex-direction: column; }
-.feed { list-style: none; margin: 8px 0 0; padding: 0; overflow: hidden; max-height: 330px; }
-.feed li { display: grid; grid-template-columns: 58px 18px 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px solid rgba(148, 163, 184, 0.08); font-size: 13px; animation: slidein 0.5s ease; }
+.feed { list-style: none; margin: 8px 0 0; padding: 0 6px 0 0; overflow-y: auto; max-height: 330px; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(148, 163, 184, 0.3) transparent; }
+.feed li { display: grid; grid-template-columns: 58px 18px 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px solid rgba(148, 163, 184, 0.08); font-size: 13px; }
+.feed li.new { animation: slidein 0.5s ease; }
 .feed time { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; padding-top: 1px; }
 .feed .k { width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; background: var(--slate); }
 .feed .k.incident, .feed .k.alert, .feed .k.fail { background: var(--critical); }

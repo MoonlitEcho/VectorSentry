@@ -32,7 +32,7 @@ for _src in ("common/src", "phase1_baseline/src", "phase2_proposed/src"):
 import numpy as np  # noqa: E402
 from starlette.applications import Starlette  # noqa: E402
 from starlette.requests import Request  # noqa: E402
-from starlette.responses import FileResponse, JSONResponse  # noqa: E402
+from starlette.responses import HTMLResponse, JSONResponse  # noqa: E402
 from starlette.routing import Mount, Route  # noqa: E402
 from starlette.staticfiles import StaticFiles  # noqa: E402
 
@@ -243,8 +243,22 @@ def create_app(rt: Runtime) -> Starlette:
         state.configure_demo(budget, tolerance)
         return JSONResponse({"budget": budget, "tolerance": tolerance})
 
-    async def index(request: Request) -> FileResponse:
-        return FileResponse(WEB_DIR / "index.html")
+    async def index(request: Request) -> HTMLResponse:
+        # Stamp each asset URL with its modification time so a reload always
+        # picks up edited front-end code instead of a cached copy.
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        for asset in ("app.js", "styles.css"):
+            html = html.replace(f"/static/{asset}\"", f"/static/{asset}?v={int((WEB_DIR / asset).stat().st_mtime)}\"")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+    class RevalidatedStaticFiles(StaticFiles):
+        """Makes browsers revalidate the front end on every load, so an edit is
+        never hidden behind a stale cached app.js."""
+
+        def file_response(self, *args, **kwargs):
+            response = super().file_response(*args, **kwargs)
+            response.headers["Cache-Control"] = "no-cache"
+            return response
 
     return Starlette(routes=[
         Route("/", index),
@@ -254,7 +268,7 @@ def create_app(rt: Runtime) -> Starlette:
         Route("/api/simulate", api_simulate, methods=["POST"]),
         Route("/api/reset", api_reset, methods=["POST"]),
         Route("/api/config", api_config, methods=["POST"]),
-        Mount("/static", StaticFiles(directory=WEB_DIR), name="static"),
+        Mount("/static", RevalidatedStaticFiles(directory=WEB_DIR), name="static"),
     ])
 
 
