@@ -10,13 +10,13 @@ from common.config import Config
 from common.data import Document, Query
 from phase2.live_sentry import (
     MAX_CONSECUTIVE_FAILURES,
-    LiveSentryContext,
-    LiveSentryState,
     STATUS_ALERT,
     STATUS_NEEDS_REVIEW,
     STATUS_REMEDIATING,
     STATUS_RESOLVED,
     STATUS_STABLE,
+    LiveSentryContext,
+    LiveSentryState,
     run_one_tick,
 )
 from phase2.migrate import labelled_canary_scorer
@@ -265,3 +265,30 @@ def test_every_tick_records_history_and_reset_clears_it():
 
     state.reset(ctx.benchmark)
     assert state.snapshot()["history"] == []
+
+
+def test_patched_documents_are_upgraded_to_exact_reembeds_after_the_incident():
+    # Force patches: pretend a patch is nearly as good as a re-embed and
+    # harmless, so the knapsack patches most documents; a permissive gate
+    # lets every batch ship. The post-incident clean-up must then replace
+    # every patch with the exact vector, leaving nothing on a patch.
+    ctx = _synthetic_context(n=200, initial_budget_level=0.3, regression_tolerance=1.0)
+    ctx.phase2.recovery_patch, ctx.phase2.harm_patch = 0.95, 0.0
+    state = LiveSentryState(ctx.benchmark)
+    state.inject_contamination(ctx, batch_fraction=0.2, seed=1)
+
+    saw_patch = False
+    for _ in range(40):
+        run_one_tick(state, ctx)
+        snap = state.snapshot()
+        saw_patch |= snap["n_patched"] > 0
+        if not snap["incident_active"] and snap["n_patched"] == 0 and snap["status"] == STATUS_RESOLVED:
+            break
+
+    assert saw_patch, "the forced setup should have produced quick patches"
+    snap = state.snapshot()
+    assert snap["n_patched"] == 0
+    assert snap["status"] == STATUS_RESOLVED
+    # Every repaired document now holds its exact clean vector.
+    repaired = state.db_b_remediated_once
+    np.testing.assert_array_equal(state.db_b_embeddings[repaired], ctx.benchmark.emb_a[repaired])

@@ -58,7 +58,11 @@ METHOD_LABELS = {
 
 
 def run(pairing: str, config_path: str) -> list[dict]:
-    cfg = load_config(config_path)
+    return run_config(pairing, load_config(config_path))
+
+
+def run_config(pairing: str, cfg) -> list[dict]:
+    """Detection F1 of every method on one already-loaded config (also used by run_study.py)."""
     set_seed(cfg.seed)
     benchmark = build_benchmark(cfg)
     n = len(benchmark.documents)

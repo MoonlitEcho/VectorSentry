@@ -1189,3 +1189,84 @@ licence stated in the handoff; starlette/uvicorn declared in `pyproject.toml`.
 **Known gaps:** the web server has no automated tests (verified by live runs
 and screenshots); all browser tabs share one demo state, which suits a
 presentation but is not a multi-user app.
+
+---
+
+## 2026-10-25 -- Production foundation: CI, `vectorsentry` package on Qdrant, dry-run/rollback, write-path guard
+
+**Why:** the owner asked what a production version would need, approved a
+phased plan, then chose a lighter "4-step shortlist": engineering foundation,
+running on a real vector database, dry-run with durable state and rollback,
+and a write-path guard.
+
+**1. Engineering foundation.**
+- Lint (ruff: pycodestyle, pyflakes, isort, bugbear, pyupgrade) and type
+  checks (mypy on `common` and `phase2`) configured in `pyproject.toml`; both
+  pass. The only bug-class findings (closures over loop variables) were
+  false positives -- each closure ran in the same iteration -- but were
+  rewritten with bound defaults so the signal stays clean.
+- GitHub Actions CI (`.github/workflows/ci.yml`): lint, types and unit tests
+  on Python 3.11 and 3.12, CPU-only torch. Pre-commit config added.
+- `phase2_proposed/web_app.py` restructured around `create_app(Runtime)` so it
+  can be tested on a tiny synthetic index; 8 API tests
+  (`test_web_app.py`) plus a test that forces quick patches and checks the
+  post-incident clean-up replaces every one with the exact vector.
+
+**2. `vectorsentry` package (`production/src/vectorsentry/`).** Reuses the
+research modules unchanged (fingerprint, calibration, scheduler, staged
+rollout) and adds the production plumbing:
+- adapters: `VectorStore` (Qdrant -- server or embedded local mode -- and an
+  in-memory store for tests) and `Embedder` (sentence-transformers);
+- `QueryLog`: document traffic and the replay canary from a real query log
+  (logged results serve as the canary's reference, since production has no
+  clean copy of the index to recompute them from);
+- lazy re-embedding: the serving model is called only for fixes the rollout
+  tries, and the spend is counted separately from the planned budget;
+- CLI: `demo-setup`, `scan`, `run [--apply]`, `runs`, `show`, `rollback`,
+  `guard-check`.
+The top-level folder is `production/`, not `vectorsentry/`: a bare folder
+named like the package shadowed it when run from the repo root.
+
+**3. Dry-run, durable state, rollback.** SQLite (`state.py`) records every
+run, every planned action (with whether it shipped), and the original vector
+of every changed document -- written before the change, so a crash in between
+leaves a restorable snapshot. Dry-run is the default.
+
+**4. Write-path guard.** `IngestGuard` runs the fingerprint on vectors before
+they are written.
+
+**Measured on a real Qdrant collection with the real MiniLM models**
+(5,000 SciFact documents, 503 silently contaminated, budget 150):
+
+| Step | Result |
+|---|---|
+| Scan | 507 flagged; search health 91.5% |
+| Dry-run | re-embed 135, patch 150; 91% of affected traffic protected; nothing changed |
+| Apply | 145 re-embedded, 50 patched, 107 rolled back by the gate; health 91.5% -> 96.4%; embedding spend 157 vs. planned 150 (re-embeds computed for batches later rejected) |
+| Rollback | 195 restored; rescan back to exactly 507 flagged and 91.5% |
+| Guard | accepted 200/200 serving-model vectors, rejected 199/200 suspect-model vectors |
+
+**Bugs found on the real run and fixed:**
+- the lazy re-embedder returned a wrongly shaped empty array when a re-plan
+  batch held no re-embeds -- the first apply crashed (recorded honestly as
+  run #2, `failed`);
+- `runs` appeared to hang: `import vectorsentry` eagerly loaded torch via the
+  engine. Package exports are now lazy (PEP 562) and `pipeline.py` imports
+  `Benchmark` for type hints only; `runs` now starts in ~2.6 s;
+- `show` listed deferred documents first (SQLite sorts NULL ranks first) and
+  recorded rolled-back fixes as "defer"; it now lists the plan in rollout
+  order and records the planned action with `applied=false`;
+- Qdrant's local client errored at interpreter shutdown; the CLI now closes it.
+
+**Tuning note (from the tests):** the fingerprint's vote size k must stay
+small relative to the probe vectors per topic. A 60-document probe batch
+over 12 topics leaves ~5 per topic, so k=10 forces votes across topics; the
+production default (300 probes, k=10) clears this on real data.
+
+**Also:** the Review III report was drafted as a shared doc, and an IEEE
+(IEEEtran) paper was written in `paper/` (kept out of the repository for
+now). The three arXiv references from the handoff notes were verified
+against arXiv and corrected (full author lists; Text-ADBench's exact title).
+
+**Known gaps:** not run at production scale (millions of vectors) or with
+concurrent workers; the SQLite store suits one process (Postgres for more).

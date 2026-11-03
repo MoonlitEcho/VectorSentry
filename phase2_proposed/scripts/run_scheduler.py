@@ -148,10 +148,10 @@ def run_optimality_gap_sweep(cfg: Config) -> pd.DataFrame:
             frontier_plan = solve_greedy(segments, n_items=sample_size, budget=budget_units)
             exact_plan = solve_exact(items, n_items=sample_size, budget=budget_units)
 
-            def _gap_pct(candidate_benefit: float) -> float:
-                if exact_plan.total_benefit <= 0:
+            def _gap_pct(candidate_benefit: float, exact_benefit: float = exact_plan.total_benefit) -> float:
+                if exact_benefit <= 0:
                     return 0.0
-                return (exact_plan.total_benefit - candidate_benefit) / exact_plan.total_benefit * 100
+                return (exact_benefit - candidate_benefit) / exact_benefit * 100
 
             rows.append(
                 {

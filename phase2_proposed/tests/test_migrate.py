@@ -9,8 +9,8 @@ from phase2.migrate import (
     execute_staged_migration,
     labelled_canary_scorer,
     replay_canary_scorer,
-    wave_is_unsafe,
     select_golden_query_indices,
+    wave_is_unsafe,
 )
 
 

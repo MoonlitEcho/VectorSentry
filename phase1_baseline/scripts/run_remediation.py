@@ -39,7 +39,6 @@ import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from common.benchmark import build_benchmark, build_contaminated_ratio, mixed_embeddings  # noqa: E402
@@ -87,7 +86,6 @@ def run_remediation_sweep(cfg: Config) -> pd.DataFrame:
         mixed = mixed_embeddings(benchmark, contaminated)
 
         flagged = detect_fn(mixed, ratio, cfg).predicted
-        n_flagged = int(flagged.sum())
 
         no_remediation = evaluate_retrieval(
             mixed, doc_ids, eval_queries, query_embeddings, benchmark.qrels_eval, benchmark.query_traffic

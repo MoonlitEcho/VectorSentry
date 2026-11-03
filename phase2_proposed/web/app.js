@@ -191,8 +191,12 @@ function renderMap(s) {
 }
 
 /* ---------- health gauge ---------- */
+let lastGaugeKey = "";
 function renderGauge(s) {
   const v = s.health == null ? 100 : s.health * 100;
+  const key = `${s.health == null}|${Math.round(v * 10)}`;
+  if (key === lastGaugeKey) return;
+  lastGaugeKey = key;
   const color = v >= 99.5 ? C.good : C.blue;
   chart("gaugeChart").setOption({
     series: [{
@@ -256,28 +260,44 @@ function renderTimeline(s) {
 }
 
 /* ---------- activity feed ---------- */
-let lastFeedKey = "";
+let lastFeedKey = "", seenEvents = new Set();
 function renderFeed(s) {
-  const key = s.events.map((e) => e.time + e.text).join("|");
+  const ids = s.events.map((e) => e.time + e.text);
+  const key = ids.join("|");
   if (key === lastFeedKey) return;
   lastFeedKey = key;
-  $("feed").innerHTML = s.events.map((e) => `<li><time>${e.time}</time><span class="k ${e.kind}"></span><span>${e.text}</span></li>`).join("");
+  // Keep the reader's scroll position and slide in only the new entries.
+  const feed = $("feed"), scroll = feed.scrollTop;
+  feed.innerHTML = s.events.map((e, i) =>
+    `<li class="${seenEvents.has(ids[i]) ? "" : "new"}"><time>${e.time}</time><span class="k ${e.kind}"></span><span>${e.text}</span></li>`).join("");
+  feed.scrollTop = scroll;
+  seenEvents = new Set(ids);
 }
 
 /* ---------- the decision ---------- */
 let lastCurveKey = "";
+let lastTabsKey = "", lastDecisionKey = "";
 function renderDecision(s) {
   const rounds = s.rounds;
-  $("decisionEmpty").classList.toggle("hidden", rounds.length > 0);
-  $("decisionBody").classList.toggle("hidden", rounds.length === 0);
-  $("roundTabs").innerHTML = rounds.length > 1 ? rounds.map((r, i) =>
-    `<button data-r="${i + 1}" class="${i + 1 === selectedRound ? "on" : ""}">Round ${i + 1}<small>${r.rows.length}</small></button>`).join("") : "";
-  document.querySelectorAll("#roundTabs button").forEach((b) => b.addEventListener("click", () => {
-    selectedRound = +b.dataset.r; lastCurveKey = ""; renderDecision(S);
-  }));
-  if (!rounds.length) return;
   if (selectedRound > rounds.length) selectedRound = 1;
+  // Each part redraws only when its own data changes: replaying setOption on
+  // every poll restarts the chart animations, so finished charts kept "reloading".
+  const tabsKey = `${rounds.map((r) => r.rows.length).join(",")}|${selectedRound}`;
+  if (tabsKey !== lastTabsKey) {
+    lastTabsKey = tabsKey;
+    $("decisionEmpty").classList.toggle("hidden", rounds.length > 0);
+    $("decisionBody").classList.toggle("hidden", rounds.length === 0);
+    $("roundTabs").innerHTML = rounds.length > 1 ? rounds.map((r, i) =>
+      `<button data-r="${i + 1}" class="${i + 1 === selectedRound ? "on" : ""}">Round ${i + 1}<small>${r.rows.length}</small></button>`).join("") : "";
+    document.querySelectorAll("#roundTabs button").forEach((b) => b.addEventListener("click", () => {
+      selectedRound = +b.dataset.r; lastCurveKey = ""; renderDecision(S);
+    }));
+  }
+  if (!rounds.length) { lastDecisionKey = ""; return; }
   const rnd = rounds[selectedRound - 1];
+  const decisionKey = `${s.injected}|${selectedRound}|${JSON.stringify(rnd)}`;
+  if (decisionKey === lastDecisionKey) return;
+  lastDecisionKey = decisionKey;
   const rows = rnd.rows;
   const budgetShare = Math.min(1, rnd.budget / Math.max(1e-9, rows.length * s.full_cost));
 

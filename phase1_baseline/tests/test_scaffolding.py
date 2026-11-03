@@ -9,6 +9,8 @@ tests alongside their code.
 
 import random
 
+import pytest
+
 import common
 import phase1
 import phase2
@@ -36,11 +38,8 @@ def test_default_config_loads_with_expected_values():
 
 
 def test_missing_config_file_raises_clear_error():
-    try:
+    with pytest.raises(FileNotFoundError):
         load_config("phase1_baseline/configs/does_not_exist.yaml")
-        assert False, "expected FileNotFoundError"
-    except FileNotFoundError:
-        pass
 
 
 def test_set_seed_is_deterministic():

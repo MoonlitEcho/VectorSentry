@@ -21,7 +21,8 @@ Two cutover strategies live here:
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable
+from collections.abc import Callable
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -29,9 +30,18 @@ from common.data import Query
 from common.metrics import evaluate_retrieval, per_query_ndcg
 
 
+class RowSource(Protocol):
+    """Anything that returns rows of vectors for an array of row indices:
+    a numpy array of every document's clean vector (the research setting), or
+    an object that computes them on demand, such as the production package's
+    lazy re-embedder, which calls the embedding model only for rows asked for."""
+
+    def __getitem__(self, idx: Any) -> np.ndarray: ...
+
+
 def build_shadow_embeddings(
     current_embeddings: np.ndarray,
-    emb_a: np.ndarray,
+    emb_a: RowSource,
     patch: Callable[[np.ndarray], np.ndarray],
     flagged_indices: np.ndarray,
     plan_actions: np.ndarray,
@@ -87,7 +97,7 @@ class MigrationReport:
 
 def execute_migration(
     current_embeddings: np.ndarray,
-    emb_a: np.ndarray,
+    emb_a: RowSource,
     patch: Callable[[np.ndarray], np.ndarray],
     flagged_indices: np.ndarray,
     plan_actions: np.ndarray,
@@ -267,7 +277,7 @@ class StagedMigrationReport:
 
 def execute_staged_migration(
     current_embeddings: np.ndarray,
-    emb_a: np.ndarray,
+    emb_a: RowSource,
     patch: Callable[[np.ndarray], np.ndarray],
     flagged_indices: np.ndarray,
     plan_actions: np.ndarray,

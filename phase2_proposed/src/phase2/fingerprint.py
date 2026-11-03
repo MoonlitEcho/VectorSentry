@@ -55,7 +55,7 @@ class FingerprintDetector:
     k: int = 10
 
     @classmethod
-    def fit(cls, emb_a: np.ndarray, emb_b: np.ndarray, probe_indices: np.ndarray, k: int = 10) -> "FingerprintDetector":
+    def fit(cls, emb_a: np.ndarray, emb_b: np.ndarray, probe_indices: np.ndarray, k: int = 10) -> FingerprintDetector:
         reference = np.vstack([emb_a[probe_indices], emb_b[probe_indices]]).astype(np.float32)
         labels = np.r_[np.zeros(len(probe_indices), dtype=bool), np.ones(len(probe_indices), dtype=bool)]
         return cls(reference, labels, min(k, len(reference)))
